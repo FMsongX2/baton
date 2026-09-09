@@ -1,0 +1,19 @@
+name = "baton-server"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# 코인 원장과 사용자. wrangler d1 create baton 으로 만든 뒤 id를 채움
+[[d1_databases]]
+binding = "DB"
+database_name = "baton"
+database_id = "PUT_D1_DATABASE_ID_HERE"
+
+[vars]
+# 페이지 한 장을 분석하는 데 드는 코인
+COINS_PER_PAGE = "1"
+# 영수증 검증을 아직 붙이지 않은 동안 구매를 막아 둠. 검증 연결 후 "0"으로 바꿈
+BLOCK_UNVERIFIED_PURCHASES = "1"
+
+# 비밀값은 저장소에 두지 않음. 아래 명령으로 등록함
+#   wrangler secret put ANTHROPIC_API_KEY
