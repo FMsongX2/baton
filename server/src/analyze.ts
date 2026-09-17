@@ -1,12 +1,12 @@
-// 악보 페이지 이미지를 Claude 비전에 넘겨 페이지별 마디수와 템포를 뽑음.
+// 악보 페이지 이미지를 GPT 비전에 넘겨 페이지별 마디수와 템포를 뽑음.
 // 앱의 barCount 정의(그 페이지가 화면에 떠 있는 동안 흐르는 마디 수)를 프롬프트에 그대로 박아 둠.
 // 정의가 어긋나면 값이 그럴듯해 보여도 페이지 넘김이 밀림.
 
-import Anthropic from '@anthropic-ai/sdk';
-import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
-// SDK의 zodOutputFormat이 zod/v4를 쓰므로 같은 진입점에서 가져와야 타입이 맞음
+import OpenAI from 'openai';
+import { zodTextFormat } from 'openai/helpers/zod';
+// 서버 전체가 같은 zod 진입점을 씀. zodTextFormat은 v3·v4 스키마를 모두 받음
 import * as z from 'zod/v4';
-import type { Env } from './env.js';
+import { analysisModel, type Env } from './env.js';
 
 /// 한 요청에 넣는 최대 페이지 수. 이미지가 많을수록 한 장에 쓰는 주의가 옅어져 나눠 보냄.
 const PAGES_PER_REQUEST = 8;
@@ -55,42 +55,53 @@ const SYSTEM = `너는 악보를 읽어 연주 진행에 필요한 수치를 뽑
 박자표는 첫 페이지에 적힌 것을 쓴다. 없으면 null로 둔다.`;
 
 /// 페이지 묶음 하나를 분석함. 이미지 순서와 page 번호를 함께 넘겨 응답을 되짚을 수 있게 함.
-async function analyzeChunk(client: Anthropic, pages: PageImage[]): Promise<Analysis> {
-  const content: Anthropic.ContentBlockParam[] = [];
+async function analyzeChunk(
+  client: OpenAI,
+  model: string,
+  pages: PageImage[],
+): Promise<Analysis> {
+  const content: OpenAI.Responses.ResponseInputMessageContentList = [];
   for (const p of pages) {
+    content.push({ type: 'input_text', text: `${p.index + 1}쪽` });
     content.push({
-      type: 'text',
-      text: `${p.index + 1}쪽`,
-    });
-    content.push({
-      type: 'image',
-      source: { type: 'base64', media_type: p.mediaType, data: p.base64 },
+      type: 'input_image',
+      // 마디선은 한 픽셀짜리 세로선이라 축소되면 뭉개짐. auto로 두면 긴 변이 줄어 단을 못 셈
+      detail: 'high',
+      image_url: `data:${p.mediaType};base64,${p.base64}`,
     });
   }
   content.push({
-    type: 'text',
+    type: 'input_text',
     text: `위 ${pages.length}장의 악보에서 쪽마다 마디수를 세고, 템포와 박자표를 읽어라. page 값은 각 이미지 앞에 적힌 쪽 번호를 그대로 쓴다.`,
   });
 
-  const response = await client.messages.parse({
-    model: 'claude-opus-5',
-    // adaptive thinking이 같은 예산을 함께 쓰므로 넉넉히 잡음.
-    // 모자라면 stop_reason이 max_tokens가 되고 parsed_output이 비어 원인을 알기 어려움
-    max_tokens: 16000,
-    thinking: { type: 'adaptive' },
-    system: SYSTEM,
-    messages: [{ role: 'user', content }],
-    output_config: { format: zodOutputFormat(AnalysisSchema) },
+  const response = await client.responses.parse({
+    model,
+    instructions: SYSTEM,
+    input: [{ role: 'user', content }],
+    // 추론 토큰이 같은 예산을 함께 쓰므로 넉넉히 잡음.
+    // 모자라면 status가 incomplete가 되고 output_parsed가 비어 원인을 알기 어려움
+    max_output_tokens: 16000,
+    reasoning: { effort: 'medium' },
+    text: { format: zodTextFormat(AnalysisSchema, 'analysis') },
   });
 
-  // 안전 분류기가 거절하면 200으로 오고 content가 비어 있으므로 먼저 확인함
-  if (response.stop_reason === 'refusal') {
-    throw new Error('모델이 이 이미지 분석을 거절함');
+  // 안전 분류기가 거절하면 200으로 오고 본문 대신 refusal이 실리므로 먼저 확인함
+  for (const item of response.output) {
+    if (item.type !== 'message') continue;
+    if (item.content.some((c) => c.type === 'refusal')) {
+      throw new Error('모델이 이 이미지 분석을 거절함');
+    }
   }
-  if (response.stop_reason === 'max_tokens') {
-    throw new Error('응답이 길이 제한에 걸려 잘림');
+  if (response.status === 'incomplete') {
+    const reason = response.incomplete_details?.reason;
+    throw new Error(
+      reason === 'max_output_tokens'
+        ? '응답이 길이 제한에 걸려 잘림'
+        : `응답이 중간에 끊김: ${reason ?? '알 수 없음'}`,
+    );
   }
-  const parsed = response.parsed_output;
+  const parsed = response.output_parsed;
   if (!parsed) throw new Error('분석 결과를 해석하지 못함');
   return parsed;
 }
@@ -98,7 +109,8 @@ async function analyzeChunk(client: Anthropic, pages: PageImage[]): Promise<Anal
 /// 악보 전체를 분석함. 페이지가 많으면 나눠 보내고 결과를 합침.
 /// 템포·박자표는 앞쪽 묶음에서 먼저 읽힌 값을 남김. 보통 첫 페이지에만 적혀 있음.
 export async function analyzeScore(env: Env, pages: PageImage[]): Promise<Analysis> {
-  const client = new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
+  const client = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+  const model = analysisModel(env);
 
   const merged: Analysis = {
     pages: [],
@@ -110,7 +122,7 @@ export async function analyzeScore(env: Env, pages: PageImage[]): Promise<Analys
 
   for (let i = 0; i < pages.length; i += PAGES_PER_REQUEST) {
     const chunk = pages.slice(i, i + PAGES_PER_REQUEST);
-    const result = await analyzeChunk(client, chunk);
+    const result = await analyzeChunk(client, model, chunk);
     merged.pages.push(...result.pages);
     if (merged.bpm === null && result.bpm !== null) {
       merged.bpm = result.bpm;

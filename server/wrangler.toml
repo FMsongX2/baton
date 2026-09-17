@@ -14,6 +14,8 @@ database_id = "PUT_D1_DATABASE_ID_HERE"
 COINS_PER_PAGE = "1"
 # 영수증 검증을 아직 붙이지 않은 동안 구매를 막아 둠. 검증 연결 후 "0"으로 바꿈
 BLOCK_UNVERIFIED_PURCHASES = "1"
+# 악보 분석 모델. 비우면 코드 기본값(gpt-5.6-luna)을 씀
+OPENAI_MODEL = "gpt-5.6-luna"
 
 # 비밀값은 저장소에 두지 않음. 아래 명령으로 등록함
-#   wrangler secret put ANTHROPIC_API_KEY
+#   wrangler secret put OPENAI_API_KEY

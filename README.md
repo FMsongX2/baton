@@ -27,7 +27,7 @@ Flutter, iOS·Android.
 | `lib/billing/` | 메트로놈 언락(1회성)과 코인 묶음(소모성) 결제 |
 | `lib/cloud/` | 서버 호출과 코인 지갑 |
 | `lib/score/ai_analysis.dart` | AI가 읽은 마디수·템포를 반영하고 되돌림 |
-| `server/` | Cloudflare Workers. Claude 키와 코인 원장을 여기에만 둠 |
+| `server/` | Cloudflare Workers. OpenAI 키와 코인 원장을 여기에만 둠 |
 
 임포트한 이미지·PDF는 입구에서 PDF 하나로 정규화함.
 파일은 `<appDocuments>/scores/<nodeId>/source.pdf`에 두고 DB에는 상대경로만 저장함.
@@ -69,7 +69,7 @@ zip 안의 경로는 앱 디렉토리 밖을 가리키면 거부하고, DB에 �
 
 ## AI 마디수 읽기
 
-코인을 써서 악보 전체를 Claude 비전에 넘기고 쪽별 마디수와 템포를 받아 설정에 반영함.
+코인을 써서 악보 전체를 GPT 비전에 넘기고 쪽별 마디수와 템포를 받아 설정에 반영함.
 반영 직전 상태를 되돌리기 지점으로 남기므로 잘못 읽어도 한 번은 되돌릴 수 있음.
 
 서버가 필요한 이유는 세 가지이며 각각 독립적으로 필수임.
@@ -97,7 +97,7 @@ cd server
 npm install
 npx wrangler d1 create baton          # 나온 database_id를 wrangler.toml에 채움
 npm run db:init                       # 스키마 적용
-npx wrangler secret put ANTHROPIC_API_KEY
+npx wrangler secret put OPENAI_API_KEY
 npm run deploy
 ```
 

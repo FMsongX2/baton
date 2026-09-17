@@ -9,7 +9,8 @@ import 'package:pdfrx/pdfrx.dart';
 /// 목록 카드에 쓰는 가로 픽셀.
 const kThumbWidth = 360;
 
-/// 분석에 보내는 가로 픽셀. Claude가 긴 변 1568px까지 그대로 보므로 그 아래로 잡되
+/// 분석에 보내는 가로 픽셀. 서버가 detail:high로 보내고 그 경로는 2931 토큰에서 포화해
+/// 이 위로 올려도 모델이 더 보지 않음(1400·2048 실측 동일).
 /// 마디선과 도돌이표가 뭉개지지 않을 만큼은 남김.
 const kAnalyzeWidth = 1400;
 
