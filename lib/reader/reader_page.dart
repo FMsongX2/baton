@@ -13,6 +13,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../ads/ads.dart';
 import '../core/db/settings_repo.dart';
 import '../core/providers.dart';
 import '../metronome/click_scheduler.dart';
@@ -138,6 +139,8 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   @override
   void initState() {
     super.initState();
+    // 연주 화면에는 광고를 두지 않음. 넘김 탭 영역·재생줄과 붙어 오터치를 부르고 반전 무대에서 번쩍임
+    Ads.suppress();
     WidgetsBinding.instance.addObserver(this);
     // 곡 사이에 멈춰도 화면이 꺼지면 손으로 깨워야 함. 리더에 있는 동안 계속 켜 둠
     WakelockPlus.enable();
@@ -244,6 +247,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     WakelockPlus.disable();
     // 다른 화면은 시스템 바가 보여야 하므로 되돌림
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    Ads.release();
     super.dispose();
   }
 

@@ -27,6 +27,16 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // AdMob 앱 ID. APK 매니페스트에 그대로 노출되는 값이라 비밀이 아님.
+        // 실제 ID는 빌드 때 -P admobAppId=... 로 넣고, 없거나 비면 공식 테스트 ID를 씀.
+        // profile은 debug를 복제해 만들어지므로 buildTypes가 아니라 여기 둬야 비지 않음
+        val admobAppId = (project.findProperty("admobAppId") as String?)?.takeIf { it.isNotBlank() }
+            ?: "ca-app-pub-3940256099942544~3347511713"
+        // SDK의 init provider가 광고 사용 여부와 무관하게 앱 시작 때 이 형식을 검사하고 틀리면 죽음
+        require(Regex("^ca-app-pub-[0-9]{16}~[0-9]{10}$").matches(admobAppId)) {
+            "admobAppId 형식이 틀림(ca-app-pub-숫자16~숫자10): $admobAppId"
+        }
+        manifestPlaceholders["admobAppId"] = admobAppId
     }
 
     buildTypes {

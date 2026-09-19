@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:pdfrx/pdfrx.dart';
 
+import 'ads/ads.dart';
 import 'core/db/database.dart';
 import 'core/providers.dart';
 import 'core/storage/paths.dart';
@@ -31,6 +32,8 @@ Future<void> main() async {
   unawaited(_purgeExpiredTrash(container.read(dbProvider)));
 
   runApp(UncontrolledProviderScope(container: container, child: const BatonApp()));
+  // 동의 폼은 첫 화면 위에 떠야 하므로 runApp 뒤에 시작함. 기다리지 않음
+  Ads.start();
 }
 
 /// 보관 기간이 지난 휴지통 항목과 그 파일을 지움. 실패해도 앱 시작을 막지 않음.
@@ -52,6 +55,9 @@ class BatonApp extends StatelessWidget {
     debugShowCheckedModeBanner: false,
     theme: batonTheme(Brightness.light),
     darkTheme: batonTheme(Brightness.dark),
+    // 배너 칸을 Navigator 밖에 하나만 둠. 화면을 오가도 다시 요청하지 않고 전체 화면 push에서도 남음
+    builder: (context, child) => AdFrame(child: child!),
+    navigatorObservers: [Ads.modalObserver],
     home: const HomeShell(),
   );
 }

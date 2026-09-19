@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../ads/ads.dart';
 import '../core/db/settings_repo.dart';
 import '../core/providers.dart';
 import '../billing/purchases.dart';
@@ -425,6 +426,17 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       leading: const Icon(Icons.unarchive_outlined),
                       title: const Text('백업 되살리기'),
                       onTap: _import,
+                    ),
+                    // 동의를 받은 지역(EEA 등)에서는 언제든 바꿀 수 있는 진입점이 있어야 함(UMP 요건)
+                    ValueListenableBuilder<bool>(
+                      valueListenable: Ads.privacyOptionsRequired,
+                      builder: (context, required, _) => required
+                          ? const ListTile(
+                              leading: Icon(Icons.privacy_tip_outlined),
+                              title: Text('광고 개인정보 옵션'),
+                              onTap: Ads.showPrivacyOptions,
+                            )
+                          : const SizedBox.shrink(),
                     ),
                     const SizedBox(height: 32),
                   ],

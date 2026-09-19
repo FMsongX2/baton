@@ -186,7 +186,15 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
                 excluding: !purchases.unlocked,
                 child: AbsorbPointer(
                   absorbing: !purchases.unlocked,
-                  child: Opacity(opacity: purchases.unlocked ? 1 : 0.25, child: _controls()),
+                  child: Opacity(
+                    opacity: purchases.unlocked ? 1 : 0.25,
+                    child: Column(
+                      children: [
+                        Expanded(child: _controls()),
+                        _playRow(),
+                      ],
+                    ),
+                  ),
                 ),
               ),
               if (!purchases.unlocked) _lockOverlay(purchases),
@@ -284,37 +292,46 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
           ),
         ],
       ),
-      const SizedBox(height: 16),
-      Row(
-        children: [
-          Expanded(
-            flex: 3,
-            child: SizedBox(
-              height: kPlayControlSize,
-              child: FilledButton.icon(
-                onPressed: _toggle,
-                icon: Icon(_running ? Icons.stop : Icons.play_arrow, size: 26),
-                label: Text(_running ? '정지' : '시작'),
-              ),
-            ),
-          ),
-          const SizedBox(width: kGapM),
-          Expanded(
-            flex: 2,
-            child: SizedBox(
-              height: kPlayControlSize,
-              child: OutlinedButton.icon(
-                onPressed: _tapTempo,
-                icon: const Icon(Icons.touch_app_outlined),
-                label: const Text('탭'),
-              ),
-            ),
-          ),
-        ],
-      ),
-      if (!_audio.ready)
-        const Padding(padding: EdgeInsets.only(top: 16), child: Text('오디오 엔진을 열지 못해 소리가 나지 않음')),
     ],
+  );
+
+  /// 시작·탭 줄. 목록 밖 아래에 고정해 화면이 작거나 광고 칸이 붙어도 스크롤 없이 누를 수 있게 함.
+  Widget _playRow() => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              flex: 3,
+              child: SizedBox(
+                height: kPlayControlSize,
+                child: FilledButton.icon(
+                  onPressed: _toggle,
+                  icon: Icon(_running ? Icons.stop : Icons.play_arrow, size: 26),
+                  label: Text(_running ? '정지' : '시작'),
+                ),
+              ),
+            ),
+            const SizedBox(width: kGapM),
+            Expanded(
+              flex: 2,
+              child: SizedBox(
+                height: kPlayControlSize,
+                child: OutlinedButton.icon(
+                  onPressed: _tapTempo,
+                  icon: const Icon(Icons.touch_app_outlined),
+                  label: const Text('탭'),
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (!_audio.ready)
+          const Padding(padding: EdgeInsets.only(top: 16), child: Text('오디오 엔진을 열지 못해 소리가 나지 않음')),
+      ],
+    ),
   );
 
   /// 값 목록을 칩으로 고르는 구역. 칩이 줄바꿈되면 옆에 둔 라벨과 어긋나므로 위에 둠.
@@ -351,51 +368,54 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
   /// 아래쪽에 붙이고 위쪽 메트로놈 UI가 그대로 보이게 둠.
   Widget _lockOverlay(Purchases purchases) => Align(
     alignment: Alignment.bottomCenter,
-    child: Card(
-      margin: const EdgeInsets.all(kGapL),
-      child: Padding(
-        padding: const EdgeInsets.all(kGapL),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.lock_outline, size: 20),
-                const SizedBox(width: kGapS),
-                Text('메트로놈', style: Theme.of(context).textTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: kGapS),
-            Text(
-              '한 번 사면 계속 씀. 악보 자동 넘김은 결제 없이 그대로 쓸 수 있음.',
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: kGapM),
-            if (purchases.lastError != null)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 8),
-                child: Text(
-                  purchases.lastError!,
-                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+    // 가로 폰에 광고 칸까지 붙으면 카드가 남은 높이보다 커져 구매 버튼이 잘림
+    child: SingleChildScrollView(
+      child: Card(
+        margin: const EdgeInsets.all(kGapL),
+        child: Padding(
+          padding: const EdgeInsets.all(kGapL),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.lock_outline, size: 20),
+                  const SizedBox(width: kGapS),
+                  Text('메트로놈', style: Theme.of(context).textTheme.titleMedium),
+                ],
+              ),
+              const SizedBox(height: kGapS),
+              Text(
+                '한 번 사면 계속 씀. 악보 자동 넘김은 결제 없이 그대로 쓸 수 있음.',
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: kGapM),
+              if (purchases.lastError != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    purchases.lastError!,
+                    style: TextStyle(color: Theme.of(context).colorScheme.error),
+                  ),
+                ),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: FilledButton(
+                  onPressed: purchases.busy || purchases.product == null ? null : purchases.buy,
+                  child: Text(
+                    purchases.product == null ? '스토어 확인 중' : '${purchases.product!.price}에 잠금 해제',
+                  ),
                 ),
               ),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: FilledButton(
-                onPressed: purchases.busy || purchases.product == null ? null : purchases.buy,
-                child: Text(
-                  purchases.product == null ? '스토어 확인 중' : '${purchases.product!.price}에 잠금 해제',
-                ),
+              TextButton(
+                onPressed: purchases.busy ? null : purchases.restore,
+                child: const Text('구매 복원'),
               ),
-            ),
-            TextButton(
-              onPressed: purchases.busy ? null : purchases.restore,
-              child: const Text('구매 복원'),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     ),

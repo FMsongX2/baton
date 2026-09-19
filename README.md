@@ -25,6 +25,7 @@ Flutter, iOS·Android.
 | `lib/reader/` | 뷰어·필기·자동 넘김 |
 | `lib/settings/pedal_keys.dart` | 페달 넘김 키 매핑. 기본값과 학습 결과 |
 | `lib/billing/` | 메트로놈 언락(1회성)과 코인 묶음(소모성) 결제 |
+| `lib/ads/ads.dart` | 광고 동의(UMP)·SDK 초기화와 앱 하단 배너 칸 |
 | `lib/cloud/` | 서버 호출과 코인 지갑 |
 | `lib/score/ai_analysis.dart` | AI가 읽은 마디수·템포를 반영하고 되돌림 |
 | `server/` | Cloudflare Workers. OpenAI 키와 코인 원장을 여기에만 둠 |
@@ -115,11 +116,46 @@ flutter run --dart-define=BATON_API_BASE=https://baton-server.<계정>.workers.d
 
 주소가 비면 코인과 AI 기능이 화면에서 숨음. 나머지 기능은 그대로 동작함.
 
+## 광고
+
+앱 하단에 320×50 배너 하나를 둠. `MaterialApp.builder`에서 Navigator 밖에 붙이므로
+화면을 오가도 다시 요청하지 않고, 폴더·설정처럼 전체 화면으로 여는 화면에도 남음.
+
+악보 뷰어가 떠 있는 동안에는 배너 칸을 뺌. 넘김 탭 영역·재생줄과 맞닿아 오터치를 부르고
+(AdMob 정책의 인터랙티브 요소 인접 금지), 어두운 무대용 반전 모드에서 밝은 광고가 번쩍임.
+
+동의 확인(UMP) 전에는 광고 요청을 보내지 않음. 동의가 필요한 지역이면 설정에
+'광고 개인정보 옵션'이 나타남. 동의 메시지는 AdMob 콘솔의 Privacy & messaging에서 만듦.
+
+디버그·프로필은 구글 공식 테스트 ID를 씀. 개발 중 실제 광고를 누르면 무효 트래픽으로
+계정이 막힐 수 있음. 실제 ID는 출시 빌드에서만 넣음.
+
+| 값 | 넣는 곳 |
+|---|---|
+| Android 앱 ID | 빌드 인자 `-P admobAppId=ca-app-pub-…~…` |
+| iOS 앱 ID | `ios/Flutter/Release.xcconfig`의 `ADMOB_APP_ID` |
+| 배너 단위 ID | 빌드 인자 `--dart-define=BATON_AD_BANNER=ca-app-pub-…/…` (플랫폼별로 다름) |
+
+릴리스에서 `BATON_AD_BANNER`가 비면 광고 요청과 동의 흐름을 아예 부르지 않음.
+다만 Android SDK의 init provider는 광고 사용과 무관하게 앱 시작 때 매니페스트 앱 ID 형식을
+검사하고 틀리면 앱을 죽임. 그래서 `admobAppId`는 비면 테스트 ID로 떨어지고, 형식이 틀리면 빌드가 실패함.
+Android 앱 ID를 빠뜨리면 테스트 앱 ID로 나가 광고가 채워지지 않음.
+대화상자·시트가 떠 있는 동안에는 배너를 배경막으로 덮어 바깥 탭이 광고로 가지 않게 함.
+
+광고가 붙으면 기기 밖으로 나가는 데이터가 생기므로 스토어 신고가 필요함.
+광고 ID, IP 주소(대략적 위치), 앱 상호작용, 진단 정보를 광고·분석 목적으로 수집·공유함.
+Play는 Data safety와 Advertising ID·Contains ads 선언, App Store는 개인정보 라벨,
+처리방침에는 AdMob 사용과 https://policies.google.com/technologies/partner-sites 링크가 들어감.
+Android 병합 매니페스트에 `AD_ID`와 `ACCESS_ADSERVICES_*` 권한이 SDK로부터 자동으로 들어옴.
+
+iOS는 ATT를 띄우지 않으므로 `NSUserTrackingUsageDescription`을 두지 않음.
+AdMob 콘솔에서 IDFA 설명 메시지를 켜면 그 키와 AppTrackingTransparency 링크를 함께 추가해야 함.
+
 ## 출시 빌드
 
 ```sh
-flutter build appbundle --release   # Play 업로드용
-flutter build ipa --release         # App Store 업로드용
+flutter build appbundle --release -P admobAppId=<Android 앱 ID> --dart-define=BATON_AD_BANNER=<Android 배너 단위>
+flutter build ipa --release --dart-define=BATON_AD_BANNER=<iOS 배너 단위>
 ```
 
 `BATON_API_BASE`를 붙이지 않음. v1은 AI 마디수 읽기를 빼고 내보내며, 주소가 비면
