@@ -4,6 +4,8 @@
 import 'package:baton/core/db/database.dart';
 import 'package:baton/reader/annotation/stroke.dart';
 import 'package:baton/score/score_repo.dart';
+import 'package:baton/score/timeline.dart';
+import 'package:drift/drift.dart' show Value;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -33,7 +35,7 @@ void main() {
     final id = await makeScore(pages: 2);
     await repo.updateSettings(id, bpm: 90, clicksPerBar: 3, countInBars: 2, leadBeats: 1);
     await repo.updatePage(id, 0, barCount: 8);
-    await repo.updatePage(id, 1, barCount: 6, bpm: 60);
+    await repo.updatePage(id, 1, barCount: 6, bpm: const Value(60));
 
     final t = (await repo.playback(id))!.timing;
     expect(t.bpm, 90);
@@ -47,9 +49,9 @@ void main() {
 
   test('오버라이드를 지우면 다시 상속함', () async {
     final id = await makeScore(pages: 1);
-    await repo.updatePage(id, 0, bpm: 200, clicksPerBar: 7);
+    await repo.updatePage(id, 0, bpm: const Value(200), clicksPerBar: const Value(7));
     expect((await repo.playback(id))!.timing.pages[0].bpm, 200);
-    await repo.updatePage(id, 0, clearOverrides: true);
+    await repo.updatePage(id, 0, bpm: const Value(null), clicksPerBar: const Value(null));
     final t = (await repo.playback(id))!.timing;
     expect(t.pages[0].bpm, isNull);
     expect(t.pages[0].clicksPerBar, isNull);
@@ -59,6 +61,61 @@ void main() {
     final id = await makeScore(pages: 4);
     await repo.distributeBars(id, 10);
     expect((await repo.pages(id)).map((p) => p.barCount), [3, 3, 2, 2]);
+  });
+
+  test('균등 배분은 숨긴 쪽과 0마디 쪽을 빼고 표시 순서 앞쪽부터 나머지를 줌', () async {
+    final id = await makeScore(pages: 5);
+    await repo.updatePage(id, 0, barCount: 7);
+    await repo.updatePage(id, 2, barCount: 0);
+    // 0쪽·3쪽은 숨김, 2쪽은 표지라 0마디
+    await repo.setPageOrder(id, [4, 1, 2]);
+    await repo.distributeBars(id, 9);
+    expect((await repo.pages(id)).map((p) => p.barCount), [7, 4, 0, 4, 5]);
+
+    final pb = (await repo.playback(id))!;
+    final played = pb.timing.pages.fold<int>(0, (sum, p) => sum + p.barCount);
+    expect(played, 9, reason: '재생되는 마디 합이 입력값과 같아야 넘김이 앞서지 않음');
+  });
+
+  test('보이는 쪽이 전부 0마디면 보이는 쪽 전부에 나눔', () {
+    final zero = [
+      for (var i = 0; i < 3; i++)
+        ScorePage(scoreId: 1, pageIndex: i, barCount: 0, bpm: null, clicksPerBar: null),
+    ];
+    expect(barDistributionTargets([2, 0], zero), [2, 0]);
+  });
+
+  test('쪽 템포 입력은 바꾼 항목만 쓰고 곡 설정과 같게 바꾸면 고정을 품', () {
+    expect(pageOverride(120, shown: 120, inherited: 120).present, isFalse, reason: '손대지 않음');
+    final same = pageOverride(96, shown: 100, inherited: 96);
+    expect(same.present && same.value == null, isTrue, reason: '곡 설정으로 되돌림');
+    expect(pageOverride(3, shown: 4, inherited: 4).value, 3);
+  });
+
+  test('박만 바꾼 쪽은 뒤에 곡 템포를 바꾸면 새 템포를 따라감', () async {
+    final id = await makeScore(pages: 2);
+    final s = (await repo.score(id))!;
+    await repo.updatePage(
+      id,
+      0,
+      bpm: pageOverride(120.0, shown: s.bpm.round(), inherited: s.bpm),
+      clicksPerBar: pageOverride(3, shown: s.clicksPerBar, inherited: s.clicksPerBar),
+    );
+    await repo.updateSettings(id, bpm: 90);
+
+    final t = (await repo.playback(id))!.timing;
+    expect(t.pages[0].bpm, isNull);
+    expect(t.pages[0].clicksPerBar, 3);
+    expect(buildTimeline(t).spans.first.bpm, 90);
+  });
+
+  test('쪽 템포와 박 고정은 따로 풂', () async {
+    final id = await makeScore(pages: 1);
+    await repo.updatePage(id, 0, bpm: const Value(140), clicksPerBar: const Value(3));
+    await repo.updatePage(id, 0, bpm: const Value(null));
+    final p = (await repo.pages(id)).single;
+    expect(p.bpm, isNull);
+    expect(p.clicksPerBar, 3);
   });
 
   test('재생 순서를 저장하고 읽음', () async {
@@ -216,7 +273,7 @@ void main() {
 
     test('페이지 오버라이드만 있어도 설정됨으로 봄', () async {
       final id = await makeScore();
-      await repo.updatePage(id, 0, bpm: 140);
+      await repo.updatePage(id, 0, bpm: const Value(140));
       expect((await repo.playback(id))!.timingUnset, isFalse);
     });
   });

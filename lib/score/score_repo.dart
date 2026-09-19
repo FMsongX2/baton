@@ -148,40 +148,42 @@ class ScoreRepo {
     );
   }
 
-  /// 페이지 한 장의 타이밍을 갱신함. bpm·clicksPerBar에 null을 넣으려면 clearOverrides를 씀.
+  /// 페이지 한 장의 타이밍을 갱신함. 빠진 인자는 건드리지 않음.
+  /// bpm·clicksPerBar는 따로 다룸. Value(null)을 넣은 항목만 오버라이드를 풀고 악보 기본값을 상속함.
   Future<void> updatePage(
     int scoreId,
     int pageIndex, {
     int? barCount,
-    double? bpm,
-    int? clicksPerBar,
-    bool clearOverrides = false,
+    Value<double?> bpm = const Value.absent(),
+    Value<int?> clicksPerBar = const Value.absent(),
   }) async {
     await (db.update(
       db.scorePages,
     )..where((p) => p.scoreId.equals(scoreId) & p.pageIndex.equals(pageIndex))).write(
       ScorePagesCompanion(
         barCount: barCount == null ? const Value.absent() : Value(barCount),
-        bpm: clearOverrides ? const Value(null) : (bpm == null ? const Value.absent() : Value(bpm)),
-        clicksPerBar: clearOverrides
-            ? const Value(null)
-            : (clicksPerBar == null ? const Value.absent() : Value(clicksPerBar)),
+        bpm: bpm,
+        clicksPerBar: clicksPerBar,
       ),
     );
   }
 
-  /// 전체 마디수를 페이지에 균등 배분함. 나머지는 앞 페이지부터 한 마디씩 더 줌.
+  /// 곡 전체 마디수를 barDistributionTargets가 고른 쪽에 균등 배분함.
+  /// 나머지는 표시 순서 앞쪽부터 한 마디씩 더 줌. 대상이 아닌 쪽의 마디수는 건드리지 않음.
   Future<void> distributeBars(int scoreId, int totalBars) async {
+    final s = await score(scoreId);
+    if (s == null || totalBars <= 0) return;
     final ps = await pages(scoreId);
-    if (ps.isEmpty || totalBars <= 0) return;
-    final base = totalBars ~/ ps.length;
-    final extra = totalBars % ps.length;
+    final targets = barDistributionTargets(parsePageOrder(s.pageOrderJson, ps.length), ps);
+    if (targets.isEmpty) return;
+    final base = totalBars ~/ targets.length;
+    final extra = totalBars % targets.length;
     await db.batch((b) {
-      for (var i = 0; i < ps.length; i++) {
+      for (var k = 0; k < targets.length; k++) {
         b.update(
           db.scorePages,
-          ScorePagesCompanion(barCount: Value(base + (i < extra ? 1 : 0))),
-          where: (p) => p.scoreId.equals(scoreId) & p.pageIndex.equals(i),
+          ScorePagesCompanion(barCount: Value(base + (k < extra ? 1 : 0))),
+          where: (p) => p.scoreId.equals(scoreId) & p.pageIndex.equals(targets[k]),
         );
       }
     });
@@ -258,6 +260,21 @@ List<int> parsePageOrder(String? json, int pageCount) {
     return fallback;
   }
 }
+
+/// 균등 배분 대상 쪽의 물리 인덱스를 표시 순서대로 고름. 숨긴 쪽은 재생되지 않으므로 뺌.
+/// 0마디로 둔 쪽(표지·해설)도 뺌. 보이는 쪽이 전부 0마디면 뺄 기준이 없어 전부 돌려줌.
+List<int> barDistributionTargets(List<int> order, List<ScorePage> pages) {
+  final counted = [
+    for (final i in order)
+      if (pages[i].barCount > 0) i,
+  ];
+  return counted.isEmpty ? order : counted;
+}
+
+/// 쪽 템포·박 입력 하나를 저장할 값으로 바꿈. 보여 준 값 그대로면 건드리지 않고(absent),
+/// 악보 기본값과 같게 바꾸면 오버라이드를 풀어(null) 이후 전체 템포·박 변경을 따라가게 함.
+Value<T?> pageOverride<T extends num>(T entered, {required num shown, required num inherited}) =>
+    entered == shown ? const Value.absent() : Value(entered == inherited ? null : entered);
 
 /// 재생과 표시에 필요한 것을 함께 담음. pageOrder는 표시 인덱스에서 물리 페이지로 가는 지도.
 class ScorePlayback {

@@ -12,8 +12,40 @@ const kApiBase = String.fromEnvironment('BATON_API_BASE');
 /// 보통 요청의 응답 한도.
 const kApiTimeout = Duration(seconds: 20);
 
-/// 분석 요청의 응답 한도. 비전 모델이 여러 장을 읽는 시간을 감안해 길게 잡음.
-const kAnalyzeTimeout = Duration(minutes: 4);
+/// 분석 요청의 응답 한도. 서버가 모델 호출을 210초(analyze.ts ANALYSIS_BUDGET_MS) 안에 끝내므로
+/// 그보다 이미지를 올리는 시간만큼 길게 잡음. 한도는 기다림만 끝내고 연결은 닫지 않아 서버는 끝까지
+/// 돌고 결과를 남김. 같은 id로 다시 보내면 409를 받다가 저장된 결과를 받음. 연결이 실제로
+/// 끊기면(네트워크 단절·앱 종료) 워커가 취소돼, 선점 기한 뒤의 재전송이 모델을 다시 부름.
+const kAnalyzeTimeout = Duration(minutes: 5);
+
+/// 분석 요청을 같은 requestId로 다시 보내기 전 대기. 합쳐 1분 남짓 기다리고 그래도 안 되면 포기함.
+/// 서버가 결과를 들고 있거나 아직 처리 중일 수 있어, 새 id로 다시 누르면 코인이 또 빠짐.
+const kAnalyzeRetryDelays = [
+  Duration(seconds: 2),
+  Duration(seconds: 5),
+  Duration(seconds: 10),
+  Duration(seconds: 20),
+  Duration(seconds: 30),
+];
+
+/// 사용자가 분석을 멈춤. 재전송하지 않고 결과도 기다리지 않음. 보낸 요청의 연결은 닫지 않음.
+class AnalysisCancelled implements Exception {
+  /// 멈춤 신호를 만듦.
+  const AnalysisCancelled();
+
+  /// 사람이 읽는 멈춤 사유.
+  @override
+  String toString() => '분석을 멈춤';
+}
+
+/// 이미 멈췄으면 work를 시작하지 않고 [AnalysisCancelled]를 던짐. 아니면 work를 시작해 cancel과 먼저
+/// 끝난 쪽을 따름. cancel이 먼저면 [AnalysisCancelled]를 던지고 work는 버림.
+Future<T> untilCancelled<T>(Future<T> Function() work, Completer<void>? cancel) async {
+  if (cancel == null) return work();
+  // Future만으로는 이미 끝났는지 알 수 없어 Completer로 받음. 시작한 요청은 멈춰도 서버에 닿아 코인이 빠짐
+  if (cancel.isCompleted) throw const AnalysisCancelled();
+  return Future.any([work(), cancel.future.then<T>((_) => throw const AnalysisCancelled())]);
+}
 
 /// 서버가 보낸 사람이 읽을 수 있는 오류. 화면에 그대로 띄움.
 class ApiException implements Exception {
@@ -27,6 +59,16 @@ class ApiException implements Exception {
   final int? needed;
 
   bool get isInsufficientCoins => statusCode == 402 && needed != null;
+
+  /// 같은 요청을 그대로 다시 보내면 되는 실패인지. 전송이 끊겨 결과를 못 받았거나(상태 코드 없음),
+  /// 서버가 같은 요청을 아직 처리 중이거나(409), 일시 오류(500·503·504)인 경우.
+  /// 402·422와 환불을 마친 502는 다시 보내도 결과가 같음.
+  bool get isRetryable =>
+      statusCode == null ||
+      statusCode == 409 ||
+      statusCode == 500 ||
+      statusCode == 503 ||
+      statusCode == 504;
 
   @override
   String toString() => message;
@@ -76,6 +118,7 @@ class PageAnalysis {
 }
 
 class ScoreAnalysis {
+  /// 서버 분석 응답 하나를 담음.
   const ScoreAnalysis({
     required this.pages,
     required this.bpm,
@@ -84,12 +127,18 @@ class ScoreAnalysis {
     required this.timeSigDen,
     required this.coinsSpent,
     required this.balance,
+    this.bpmUnit,
   });
 
   final List<PageAnalysis> pages;
+
+  /// 악보에 적힌 숫자 그대로. 단위는 [bpmUnit]이라 앱의 클릭 템포와 다를 수 있음.
   final double? bpm;
 
-  /// marking(악보에 숫자 표기) / tempo_word(용어만) / none(표기 없음).
+  /// 템포 표기의 음표 단위. quarter, dotted_quarter, half, eighth 등. 읽지 못했으면 null.
+  final String? bpmUnit;
+
+  /// marking(악보에 숫자 표기) / tempo_word(용어만, bpm 없음) / none(표기 없음).
   final String bpmSource;
   final int? timeSigNum;
   final int? timeSigDen;
@@ -107,14 +156,22 @@ class ApiUnauthorized extends ApiException {
 }
 
 class ApiClient {
-  ApiClient({http.Client? httpClient, this.baseUrl = kApiBase, this.timeout = kApiTimeout})
-    : _http = httpClient ?? http.Client();
+  /// 서버 창구를 만듦. 통신 대역과 재시도 간격은 테스트가 바꿈.
+  ApiClient({
+    http.Client? httpClient,
+    this.baseUrl = kApiBase,
+    this.timeout = kApiTimeout,
+    this.analyzeRetryDelays = kAnalyzeRetryDelays,
+  }) : _http = httpClient ?? http.Client();
 
   final http.Client _http;
   final String baseUrl;
 
   /// 응답을 기다리는 한도. 없으면 끊긴 회선에서 화면이 영영 진행 중으로 남음.
   final Duration timeout;
+
+  /// 분석을 같은 requestId로 다시 보내기 전 대기. 길이가 곧 재시도 횟수.
+  final List<Duration> analyzeRetryDelays;
 
   /// 서버 주소가 주입되지 않았으면 기능을 통째로 감춤.
   bool get configured => baseUrl.isNotEmpty;
@@ -189,12 +246,25 @@ class ApiClient {
   }
 
   /// 복구 코드를 새로 발급받음. 서버는 해시만 들고 있어 이 응답이 평문을 보는 유일한 기회임.
-  /// 발급하면 이전 코드는 무효가 됨.
+  /// 받은 코드는 [confirmRecoveryCode] 전까지 대기 상태이고 이전 코드가 그대로 통함.
   Future<String> issueRecoveryCode(String token) async {
     final res = await _send(
       () => _http.post(Uri.parse('$baseUrl/v1/device/recovery'), headers: _headers(token)),
     );
     return (_decode(res))['recoveryCode'] as String;
+  }
+
+  /// 받아 적은 대기 코드를 적용함. 이 순간부터 이전 코드는 무효가 됨.
+  /// 같은 코드로 다시 보내도 결과가 같아 응답이 유실되면 그대로 재시도하면 됨.
+  Future<void> confirmRecoveryCode(String token, String recoveryCode) async {
+    final res = await _send(
+      () => _http.post(
+        Uri.parse('$baseUrl/v1/device/recovery/confirm'),
+        headers: _headers(token),
+        body: jsonEncode({'recoveryCode': recoveryCode}),
+      ),
+    );
+    _decode(res);
   }
 
   /// 코인 잔액을 다시 읽음.
@@ -244,42 +314,57 @@ class ApiClient {
 
   /// 페이지 이미지를 넘겨 쪽별 마디수와 템포를 받음. 코인은 서버가 먼저 빼고 실패하면 되돌려 줌.
   /// requestId는 재시도를 구분하는 열쇠. 같은 값으로 다시 부르면 코인이 두 번 빠지지 않고
-  /// 이미 끝난 분석이면 저장된 결과가 그대로 옴. 응답이 유실돼도 되찾을 수 있어야 함.
+  /// 이미 끝난 분석이면 저장된 결과가 그대로 옴. 그래서 결과를 못 받은 실패([ApiException.isRetryable])는
+  /// [analyzeRetryDelays]만큼 같은 id로 다시 보냄. 본문은 한 번만 만들어 재시도에 그대로 씀.
+  /// cancel이 완료되면 새 요청을 시작하지 않고 기다림과 재전송을 멈춘 뒤 [AnalysisCancelled]를 던짐.
   Future<ScoreAnalysis> analyze(
     String token, {
     required String requestId,
     required List<({int index, Uint8List png})> pages,
+    Completer<void>? cancel,
   }) async {
-    final res = await _send(
-      () => _http.post(
-        Uri.parse('$baseUrl/v1/analyze'),
-        headers: _headers(token),
-        body: jsonEncode({
-          'requestId': requestId,
-          'pages': [
-            for (final p in pages)
-              {'index': p.index, 'mediaType': 'image/png', 'base64': base64Encode(p.png)},
-          ],
-        }),
-      ),
-      limit: kAnalyzeTimeout,
-    );
-    final body = _decode(res);
-    return ScoreAnalysis(
-      pages: [
-        for (final p in (body['pages'] as List).cast<Map<String, dynamic>>())
-          PageAnalysis(
-            page: (p['page'] as num).toInt(),
-            bars: (p['bars'] as num).toInt(),
-            confidence: p['confidence'] as String,
-          ),
+    final body = jsonEncode({
+      'requestId': requestId,
+      'pages': [
+        for (final p in pages)
+          {'index': p.index, 'mediaType': 'image/png', 'base64': base64Encode(p.png)},
       ],
-      bpm: (body['bpm'] as num?)?.toDouble(),
-      bpmSource: body['bpmSource'] as String? ?? 'none',
-      timeSigNum: (body['timeSigNum'] as num?)?.toInt(),
-      timeSigDen: (body['timeSigDen'] as num?)?.toInt(),
-      coinsSpent: (body['coinsSpent'] as num?)?.toInt() ?? 0,
-      balance: (body['balance'] as num?)?.toInt() ?? 0,
-    );
+    });
+    for (var attempt = 0; ; attempt++) {
+      try {
+        // 멈춰도 보낸 요청은 닫지 않음. 서버가 끝까지 돌아 남긴 결과를 다음에 같은 id로 받음
+        final res = await untilCancelled(
+          () => _send(
+            () =>
+                _http.post(Uri.parse('$baseUrl/v1/analyze'), headers: _headers(token), body: body),
+            limit: kAnalyzeTimeout,
+          ),
+          cancel,
+        );
+        return _parseAnalysis(_decode(res));
+      } on ApiException catch (e) {
+        if (!e.isRetryable || attempt >= analyzeRetryDelays.length) rethrow;
+        await untilCancelled(() => Future<void>.delayed(analyzeRetryDelays[attempt]), cancel);
+      }
+    }
   }
+
+  /// 분석 응답 본문을 읽음.
+  ScoreAnalysis _parseAnalysis(Map<String, dynamic> body) => ScoreAnalysis(
+    pages: [
+      for (final p in (body['pages'] as List).cast<Map<String, dynamic>>())
+        PageAnalysis(
+          page: (p['page'] as num).toInt(),
+          bars: (p['bars'] as num).toInt(),
+          confidence: p['confidence'] as String,
+        ),
+    ],
+    bpm: (body['bpm'] as num?)?.toDouble(),
+    bpmUnit: body['bpmUnit'] as String?,
+    bpmSource: body['bpmSource'] as String? ?? 'none',
+    timeSigNum: (body['timeSigNum'] as num?)?.toInt(),
+    timeSigDen: (body['timeSigDen'] as num?)?.toInt(),
+    coinsSpent: (body['coinsSpent'] as num?)?.toInt() ?? 0,
+    balance: (body['balance'] as num?)?.toInt() ?? 0,
+  );
 }

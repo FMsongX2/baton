@@ -1,6 +1,8 @@
 // 재생 엔진의 상태 전이. 카운트인 셈, 일시정지 후 재개 되감기, 멈춘 뒤 진행률 갱신을 고정함.
 // 오디오 엔진 없이 돌려야 하므로 클럭에는 직접 움직이는 가짜 시계를 물림.
 
+import 'dart:async';
+
 import 'package:baton/metronome/click_scheduler.dart';
 import 'package:baton/metronome/clock.dart';
 import 'package:baton/score/playback_engine.dart';
@@ -33,6 +35,10 @@ class _FakeScheduler implements ClickScheduler {
 
   @override
   void rewindTo(Duration p) => load(clicks, p);
+
+  /// 기준점을 미래로 미는 길이. 0이면 위치가 시각과 그대로 맞아 기대값을 적기 쉬움.
+  @override
+  Duration startLead = Duration.zero;
 
   @override
   int pump() {
@@ -188,5 +194,183 @@ void main() {
     expect(engine.position, Duration.zero);
     expect(engine.isPlaying.value, isTrue);
     expect(engine.spanIndex.value, 0);
+  });
+
+  test('재생을 누르면 멈춘 사이 화면이 어디 있든 재생 위치의 페이지를 다시 알림', () {
+    final pages = <int>[];
+    engine.onPageChanged = pages.add;
+    engine.play();
+    advanceTo(4.6);
+    engine.pause();
+    // 멈춘 동안 페달로 다른 쪽을 봤어도 엔진은 모름. 같은 스팬 안에서 재개해도 알려야 화면이 돌아옴
+    pages.clear();
+    engine.play();
+    expect(pages, [0]);
+  });
+
+  test('시작 기준점을 미래로 미는 동안에는 카운트인 숫자를 띄우지 않음', () {
+    scheduler.startLead = const Duration(milliseconds: 150);
+    engine.play();
+    expect(engine.position, const Duration(milliseconds: -150));
+    expect(engine.countInRemaining, isNull);
+    advanceTo(0.15);
+    expect(engine.position, Duration.zero);
+    expect(engine.countInRemaining, 4);
+  });
+
+  test('건너뛴 직후 기준점 대기 중에 멈추면 건너뛴 지점에 멈춘 것으로 보고 그 마디선에서 되감음', () {
+    // 대기 중 위치는 목표(10초) 앞. 그대로 멈추면 재개가 앞 쪽 마디선(8초)에서 한 마디 더 물러서 6초로 감
+    scheduler.startLead = const Duration(milliseconds: 150);
+    engine.play();
+    advanceTo(5.0);
+    engine.jumpToSpan(1);
+    engine.pause();
+    expect(engine.position, const Duration(seconds: 10));
+    engine.play();
+    advanceTo(5.15);
+    expect(engine.position, const Duration(seconds: 8));
+  });
+
+  test('재개 기준점 대기 중에 멈췄다 다시 재개하면 같은 마디선에서 같은 카운트인을 셈', () {
+    // 소리 한 번 없이 멈춘 재개가 되감기를 또 타면 8초에서 6초로 한 마디 더 물러서 앞 쪽을 보여 줌
+    engine.play();
+    advanceTo(10.5);
+    engine.pause();
+    scheduler.startLead = const Duration(milliseconds: 150);
+    engine.play();
+    engine.pause();
+    expect(engine.position, const Duration(seconds: 8));
+    engine.play();
+    advanceTo(10.65);
+    expect(engine.position, const Duration(seconds: 8));
+    expect(engine.countInRemaining, 4);
+  });
+
+  test('오디오 세션 사건(전화·이어폰 빠짐)이 오면 스스로 멈추고 다시 틀지 않음', () async {
+    final halts = StreamController<void>();
+    final engine = PlaybackEngine(PlaybackClock(now.call, halts: halts.stream), scheduler)
+      ..load(_timeline());
+    engine.play();
+    halts.add(null);
+    await pumpEventQueue();
+    expect(engine.isPlaying.value, isFalse);
+    engine.dispose();
+    await halts.close();
+  });
+
+  group('0마디 쪽', () {
+    Timeline coverFirst() => buildTimeline(
+      const ScoreTiming(
+        bpm: 120,
+        clicksPerBar: 4,
+        leadBeats: 0,
+        pages: [PageTiming(barCount: 0), PageTiming(barCount: 4), PageTiming(barCount: 4)],
+      ),
+    );
+
+    test('악보를 열면 표지를 건너뛰어 카운트인 동안 첫 연주 페이지가 보임', () {
+      final pages = <int>[];
+      engine.onPageChanged = pages.add;
+      engine.load(coverFirst());
+      expect(pages.last, 1);
+      engine.play();
+      advanceTo(1.0);
+      expect(engine.spanIndex.value, 1);
+    });
+
+    test('건너뛰기는 빈 쪽에 서지 않고 가는 방향의 실제 쪽으로 감', () {
+      engine.load(
+        buildTimeline(
+          const ScoreTiming(
+            bpm: 120,
+            clicksPerBar: 4,
+            leadBeats: 0,
+            pages: [PageTiming(barCount: 4), PageTiming(barCount: 0), PageTiming(barCount: 4)],
+          ),
+        ),
+      );
+      engine.play();
+      engine.jumpToSpan(1);
+      expect(engine.spanIndex.value, 2);
+      engine.jumpToSpan(1);
+      expect(engine.spanIndex.value, 0, reason: '뒤로 가다 빈 쪽에 걸려 제자리로 돌아오면 안 됨');
+    });
+  });
+
+  test('스팬 시작으로 건너뛴 뒤 재개해도 µs 반올림 때문에 앞 스팬으로 떨어지지 않음', () {
+    // 100bpm 4/4에서 넷째 쪽 시작은 누적 오차로 31.20000000000003이고 Duration으로는 31.2가 됨
+    final t = buildTimeline(
+      ScoreTiming(
+        bpm: 100,
+        clicksPerBar: 4,
+        leadBeats: 0,
+        pages: List.filled(5, const PageTiming(barCount: 4)),
+      ),
+    );
+    engine.load(t);
+    engine.jumpToSpan(3);
+    engine.play();
+    final bar = barSeconds(4, 100);
+    expect(engine.position.inMicroseconds / 1e6, closeTo(t.spans[3].start - bar, 1e-6));
+    expect(engine.countInRemaining, 4);
+  });
+
+  test('첫 스팬으로 건너뛴 뒤 재개해도 카운트인을 다시 셈', () {
+    // 72bpm은 카운트인 끝이 µs로 내림되어, 반올림을 덮지 않으면 카운트인 구간으로 판정됨
+    engine.load(
+      buildTimeline(
+        const ScoreTiming(
+          bpm: 72,
+          clicksPerBar: 4,
+          leadBeats: 0,
+          pages: [PageTiming(barCount: 4), PageTiming(barCount: 4)],
+        ),
+      ),
+    );
+    engine.jumpToSpan(0);
+    engine.play();
+    expect(engine.position, Duration.zero);
+    expect(engine.countInRemaining, 4);
+  });
+
+  test('재개 되감기가 앞 페이지로 넘어가면 그 페이지의 템포로 한 마디를 셈', () {
+    // 앞쪽 60bpm(마디 4초), 뒤쪽 120bpm(마디 2초). 카운트인은 첫 쪽 템포라 4초
+    engine.load(
+      buildTimeline(
+        const ScoreTiming(
+          bpm: 60,
+          clicksPerBar: 4,
+          leadBeats: 0,
+          pages: [PageTiming(barCount: 2), PageTiming(barCount: 2, bpm: 120)],
+        ),
+      ),
+    );
+    engine.play();
+    // 뒤쪽 첫 마디 도중(12초 시작)
+    advanceTo(12.5);
+    engine.pause();
+    engine.play();
+    expect(engine.position.inMilliseconds, 8000, reason: '앞쪽 마지막 마디선');
+    expect(engine.countInRemaining, 4);
+  });
+
+  test('재개 되감기가 박자가 다른 앞 페이지로 넘어가도 마디선에 섬', () {
+    // 앞쪽 3/4(마디 1.5초), 뒤쪽 4/4(마디 2초), 같은 120bpm
+    engine.load(
+      buildTimeline(
+        const ScoreTiming(
+          bpm: 120,
+          clicksPerBar: 3,
+          leadBeats: 0,
+          pages: [PageTiming(barCount: 2), PageTiming(barCount: 2, clicksPerBar: 4)],
+        ),
+      ),
+    );
+    engine.play();
+    advanceTo(5.0);
+    engine.pause();
+    engine.play();
+    expect(engine.position.inMilliseconds, 3000);
+    expect(engine.countInRemaining, 3);
   });
 }

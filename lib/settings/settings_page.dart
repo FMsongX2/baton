@@ -1,6 +1,5 @@
 // 설정 화면. 기기마다 다른 값(출력 지연)과 데이터 관리(백업·휴지통)를 모아 둠.
 
-import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -11,10 +10,12 @@ import 'package:share_plus/share_plus.dart';
 
 import '../ads/ads.dart';
 import '../core/db/settings_repo.dart';
+import '../core/progress_dialog.dart';
 import '../core/providers.dart';
 import '../billing/purchases.dart';
 import '../cloud/coin_wallet.dart';
 import '../core/storage/backup.dart';
+import '../score/import/import_sources.dart';
 import '../theme.dart';
 import 'pedal_keys.dart';
 import 'trash_page.dart';
@@ -31,21 +32,33 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   bool _loaded = false;
   PedalKeys _pedal = PedalKeys.defaults;
 
+  /// 설정을 읽지 못한 사유. null이 아니면 목록 맨 위에 보여 줌.
+  String? _loadError;
+
   @override
   void initState() {
     super.initState();
     _load();
   }
 
-  /// 저장된 설정을 읽어 화면에 반영함.
+  /// 저장된 설정을 읽어 화면에 반영함. 읽지 못해도 기본값으로 화면을 열고 사유를 보여 줌.
+  /// DB가 깨졌을 때 스피너에 머물면 되살리기 버튼에도 닿지 못함.
   Future<void> _load() async {
     final settings = ref.read(settingsRepoProvider);
-    final ms = await settings.getDouble(kLatencyMsKey, 0);
-    final pedal = await loadPedalKeys(settings);
+    var ms = 0.0;
+    var pedal = PedalKeys.defaults;
+    String? error;
+    try {
+      ms = await settings.getDouble(kLatencyMsKey, 0);
+      pedal = await loadPedalKeys(settings);
+    } catch (e) {
+      error = '$e';
+    }
     if (!mounted) return;
     setState(() {
       _latencyMs = ms;
       _pedal = pedal;
+      _loadError = error;
       _loaded = true;
     });
   }
@@ -101,7 +114,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             for (final k in keys)
-              InputChip(label: Text(_keyLabel(k)), onDeleted: () => _forgetPedal(k)),
+              InputChip(label: Text(pedalKeyLabel(k)), onDeleted: () => _forgetPedal(k)),
             ActionChip(
               avatar: const Icon(Icons.add, size: 18),
               label: const Text('밟아서 지정'),
@@ -118,26 +131,44 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ref.read(settingsRepoProvider).set(kLatencyMsKey, ms.toStringAsFixed(0));
 
   /// 라이브러리 전체를 zip으로 내보내 공유 시트로 넘김.
+  /// 만드는 동안 진행 대화상자로 막음. 다시 누르면 새 내보내기가 만들던 zip을 지움.
   Future<void> _export() async {
     final messenger = ScaffoldMessenger.of(context);
-    messenger.showSnackBar(const SnackBar(content: Text('백업 만드는 중')));
     try {
-      final file = await exportBackup(ref.read(dbProvider));
-      messenger.hideCurrentSnackBar();
+      final file = await runWithProgress(
+        context,
+        '백업 만드는 중',
+        () => exportBackup(ref.read(dbProvider)),
+      );
       await SharePlus.instance.share(ShareParams(files: [XFile(file.path)], text: 'Baton 백업'));
     } catch (e) {
-      messenger.hideCurrentSnackBar();
       messenger.showSnackBar(SnackBar(content: Text('백업 실패: $e')));
     }
   }
 
-  /// 백업 zip을 골라 되살림. 되살린 뒤에는 앱을 다시 시작해야 함.
+  /// 백업 zip을 골라 되살림. 되살린 뒤에는 앱을 다시 시작해야 함. 끝나면 선택기 사본을 지움.
   Future<void> _import() async {
-    final picked = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['zip'],
-    );
-    if (picked.isEmpty || picked.first.path == null || !mounted) return;
+    final List<PlatformFile> picked;
+    try {
+      picked = await FilePicker.pickFiles(type: FileType.custom, allowedExtensions: const ['zip']);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(importErrorMessage(e))));
+      }
+      return;
+    }
+    final path = picked.isEmpty ? null : picked.first.path;
+    if (path == null) return;
+    try {
+      await _restore(path);
+    } finally {
+      await discardImportSources(ImportSource.files, [path]);
+    }
+  }
+
+  /// 고른 백업 zip으로 되살림. 확인을 받고 진행 표시를 띄움.
+  Future<void> _restore(String path) async {
+    if (!mounted) return;
 
     final ok = await showDialog<bool>(
       context: context,
@@ -156,42 +187,39 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     if (ok != true || !mounted) return;
 
     final messenger = ScaffoldMessenger.of(context);
-    final navigator = Navigator.of(context);
     // 라이브러리를 통째로 갈아엎는 동안 아무 표시가 없으면 화면이 멈춘 것으로 보임
-    unawaited(
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => const AlertDialog(
-          content: Row(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(width: kGapL),
-              Expanded(child: Text('백업을 되살리는 중')),
-            ],
-          ),
-        ),
+    String title;
+    String message;
+    try {
+      await runWithProgress(
+        context,
+        '백업을 되살리는 중',
+        () => importBackup(File(path), ref.read(dbProvider)),
+      );
+      title = '되살리기 완료';
+      message = '앱을 완전히 닫았다가 다시 열어야 반영됨.';
+    } on RestoreNeedsRestart catch (e) {
+      // DB를 닫은 뒤 실패했거나 앞선 교체가 남아 있음. 되돌리기는 다음 시작 때 마침
+      title = '되살리기 실패';
+      message = '앱을 완전히 닫았다가 다시 열어야 함. 다시 열 때 원래 라이브러리로 되돌림.\n($e)';
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('되살리기 실패: $e')));
+      return;
+    }
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('확인'))],
       ),
     );
-    try {
-      await importBackup(File(picked.first.path!), ref.read(dbProvider));
-      navigator.pop();
-      if (!mounted) return;
-      await showDialog<void>(
-        context: context,
-        builder: (c) => AlertDialog(
-          title: const Text('되살리기 완료'),
-          content: const Text('앱을 완전히 닫았다가 다시 열어야 반영됨.'),
-          actions: [FilledButton(onPressed: () => Navigator.pop(c), child: const Text('확인'))],
-        ),
-      );
-    } catch (e) {
-      navigator.pop();
-      messenger.showSnackBar(SnackBar(content: Text('되살리기 실패: $e')));
-    }
   }
 
-  /// 복구 코드를 입력받아 다른 기기의 코인을 이 기기로 옮김.
+  /// 복구 코드를 입력받아 다른 기기의 코인을 이 기기로 옮김. 입력의 대시·공백은 지갑이 맞춤.
+  /// 이 기기에 남은 코인이 있거나 잔액을 확인하지 못하면 버려진다고 먼저 알리고,
+  /// 이 기기의 복구 코드를 받아 둘 길을 줌.
   Future<void> _restoreCoins(CoinWallet wallet) async {
     final controller = TextEditingController();
     final code = await showDialog<String>(
@@ -222,52 +250,137 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       ),
     );
     if (code == null || code.trim().isEmpty || !mounted) return;
-    final ok = await wallet.restore(code.trim());
+    var result = await wallet.restore(code);
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(ok ? '코인을 가져옴' : (wallet.lastError ?? '가져오지 못함'))));
-  }
-
-  /// 복구 코드를 새로 받아 보여 줌. 서버는 해시만 들고 있어 이미 발급한 코드를 다시 볼 수 없으므로
-  /// 재발급으로 대신함. 이전 코드는 이 순간부터 통하지 않음.
-  Future<void> _issueRecoveryCode(CoinWallet wallet) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final ok = await wallet.issueRecoveryCode();
-    if (!mounted) return;
-    if (!ok || wallet.recoveryCode == null) {
-      messenger.showSnackBar(SnackBar(content: Text(wallet.lastError ?? '복구 코드를 받지 못함')));
-      return;
+    if (result == RestoreResult.wouldDiscard) {
+      // lastError가 있으면 잔액을 확인하지 못한 경우라 버려질 코인 수를 모름
+      final loss = wallet.lastError == null
+          ? '가져오면 이 기기에 남은 ${wallet.balance}코인은 쓸 수 없게 됨.'
+          : '${wallet.lastError}\n남은 코인이 있으면 가져오는 순간 쓸 수 없게 됨.';
+      // true면 이 기기의 코드를 먼저 받아 둠, false면 그냥 버림, null이면 그만둠
+      final saveFirst = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('이 기기의 코인이 버려짐'),
+          content: Text('$loss\n이 기기의 복구 코드를 먼저 받아 두면 나중에 그 코드로 되찾을 수 있음.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('취소')),
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('버리고 가져오기')),
+            FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('코드 먼저 받기')),
+          ],
+        ),
+      );
+      if (saveFirst == null || !mounted) return;
+      if (saveFirst && !await _issueRecoveryCode(wallet)) return;
+      if (!mounted) return;
+      result = await wallet.restore(code, discardCurrent: true);
+      if (!mounted) return;
     }
-    await _showRecoveryCode(wallet, wallet.recoveryCode!);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          result == RestoreResult.restored ? '코인을 가져옴' : (wallet.lastError ?? '가져오지 못함'),
+        ),
+      ),
+    );
   }
 
-  /// 복구 코드를 크게 보여 줌. 이 코드를 잃으면 기기를 바꿀 때 코인을 되찾을 수 없음.
-  Future<void> _showRecoveryCode(CoinWallet wallet, String code) async {
-    await showDialog<void>(
+  /// 복구 코드를 새로 받아 보여 주고, 적어 뒀다고 확인해야 서버에 적용함. 적용되면 true.
+  /// 적용 전까지는 이전 코드가 그대로 통하므로 받기나 확인이 실패해도 코드를 잃지 않음.
+  Future<bool> _issueRecoveryCode(CoinWallet wallet) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final code = await wallet.issueRecoveryCode();
+    if (!mounted) return false;
+    if (code == null) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('복구 코드를 받지 못함: ${wallet.lastError ?? ''}\n이전 코드는 그대로 쓸 수 있음')),
+      );
+      return false;
+    }
+    final applied = await _showRecoveryCode(wallet, code);
+    if (!mounted) return applied == true;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(switch (applied) {
+          true => '새 복구 코드로 바뀜. 이전 코드는 이제 쓸 수 없음',
+          false => '새 코드를 적용하지 않음. 이전 코드를 그대로 씀',
+          null => '적용됐는지 확인하지 못함. 복구 코드를 다시 받아 적어 둠',
+        }),
+      ),
+    );
+    return applied == true;
+  }
+
+  /// 복구 코드를 크게 보여 주고 '적어 뒀음'을 누르면 서버에 적용함. 바깥을 눌러 닫히지 않음.
+  /// 적용되면 true, 적용을 시도하지 않고 닫으면 false, 시도가 실패한 채 닫으면 결과를 몰라 null.
+  /// 적용은 같은 코드로 다시 보내도 안전하므로 실패하면 대화상자를 연 채 다시 누를 수 있음.
+  Future<bool?> _showRecoveryCode(CoinWallet wallet, String code) async {
+    String? error;
+    var sending = false;
+    var attempted = false;
+    final applied = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('복구 코드'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text('기기를 바꿀 때 코인을 옮기는 유일한 방법임. 적어 두길 권함.\n이전에 받은 코드는 이제 쓸 수 없음.'),
-            const SizedBox(height: kGapL),
-            SelectableText(
-              code,
-              style: Theme.of(context).textTheme.headlineSmall
-                  ?.copyWith(fontFeatures: kTabular, letterSpacing: 2),
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('복구 코드'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('기기를 바꿀 때 코인을 옮기는 유일한 방법임. 적어 두고 확인을 누르면 이전 코드는 쓸 수 없게 됨.'),
+              const SizedBox(height: kGapL),
+              SelectableText(
+                code,
+                style: Theme.of(ctx).textTheme.headlineSmall
+                    ?.copyWith(fontFeatures: kTabular, letterSpacing: 2),
+              ),
+              if (error != null) ...[
+                const SizedBox(height: kGapM),
+                Text(error!, style: TextStyle(color: Theme.of(ctx).colorScheme.error)),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: sending ? null : () => Navigator.pop(ctx),
+              child: const Text('취소'),
+            ),
+            FilledButton(
+              onPressed: sending
+                  ? null
+                  : () async {
+                      setDialog(() => sending = true);
+                      attempted = true;
+                      final ok = await wallet.confirmRecoveryCode(code);
+                      if (!ctx.mounted) return;
+                      if (ok) return Navigator.pop(ctx, true);
+                      setDialog(() {
+                        sending = false;
+                        error = '적용하지 못함: ${wallet.lastError ?? ''}\n다시 누르면 이어서 적용함';
+                      });
+                    },
+              child: const Text('적어 뒀음'),
             ),
           ],
         ),
-        actions: [
-          FilledButton(
-            onPressed: () {
-              wallet.dismissRecoveryCode();
-              Navigator.pop(ctx);
-            },
-            child: const Text('적어 뒀음'),
-          ),
-        ],
+      ),
+    );
+    if (applied == true) return true;
+    return attempted ? null : false;
+  }
+
+  /// 구매 복원을 돌리고 결과를 알림. 복원할 것이 없거나 실패해도 조용히 끝나지 않게 함.
+  Future<void> _restorePurchases(Purchases purchases) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final result = await purchases.restore();
+    if (!mounted) return;
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(switch (result) {
+          PurchaseRestore.unlocked => '메트로놈 잠금 해제됨',
+          PurchaseRestore.nothing => '이 스토어 계정에는 메트로놈 구매 기록이 없음',
+          PurchaseRestore.failed => '구매 복원 실패: ${purchases.lastError ?? ''}',
+        }),
       ),
     );
   }
@@ -288,6 +401,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
             : () async {
                 final messenger = ScaffoldMessenger.of(context);
                 await wallet.refresh();
+                // 적립하지 못한 코인 구매가 남아 있으면 이때 다시 넣음
+                await purchases.retryCoinPurchases();
                 if (!mounted) return;
                 messenger.showSnackBar(
                   SnackBar(content: Text(wallet.lastError ?? '잔액 ${wallet.balance}코인')),
@@ -298,9 +413,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     ListTile(
       leading: const Icon(Icons.key_outlined),
       title: const Text('복구 코드 받기'),
-      subtitle: const Text('기기를 바꿀 때 코인을 옮기는 유일한 방법. 받으면 이전 코드는 못 씀'),
-      // ponytail: v1에서는 서버 주소가 없어 이 구역이 트리에 없음.
-      // AI·코인을 켤 때 되돌릴 수 없는 재발급 앞에 확인 단계를 먼저 붙일 것
+      subtitle: const Text('기기를 바꿀 때 코인을 옮기는 유일한 방법. 적어 뒀다고 확인하면 이전 코드는 못 씀'),
       onTap: wallet.busy ? null : () => _issueRecoveryCode(wallet),
     ),
     for (final product in purchases.coinProducts)
@@ -309,7 +422,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         title: Text(product.title.isEmpty ? product.id : product.title),
         subtitle: Text(product.description),
         trailing: FilledButton(
-          onPressed: purchases.busy ? null : () => purchases.buyCoins(product),
+          // 등록 전에 사면 넣을 곳이 없어 결제만 됨. 지갑이 준비된 뒤에만 켬
+          onPressed: purchases.busy || !wallet.ready ? null : () => purchases.buyCoins(product),
           child: Text(product.price),
         ),
       ),
@@ -324,13 +438,11 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       title: const Text('다른 기기에서 코인 가져오기'),
       onTap: wallet.busy ? null : () => _restoreCoins(wallet),
     ),
-    if (wallet.lastError != null)
+    // 코인 구매 정리 오류(purchases.coinError)도 메트로놈 구역이 아니라 여기 보임
+    for (final error in [wallet.lastError, purchases.coinError].nonNulls)
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: kGapL),
-        child: Text(
-          wallet.lastError!,
-          style: TextStyle(color: Theme.of(context).colorScheme.error),
-        ),
+        child: Text(error, style: TextStyle(color: Theme.of(context).colorScheme.error)),
       ),
   ];
 
@@ -347,6 +459,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               child: ContentWidth(
                 child: ListView(
                   children: [
+                    if (_loadError != null)
+                      ListTile(
+                        leading: const Icon(Icons.error_outline),
+                        title: const Text('설정을 읽지 못해 기본값을 보여 줌'),
+                        subtitle: Text(_loadError!),
+                      ),
                     const SectionHeader('소리'),
                     ListTile(
                       title: const Text('출력 지연 보정'),
@@ -397,10 +515,27 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                       title: Text(purchases.unlocked ? '잠금 해제됨' : '잠김'),
                       subtitle: const Text('기기를 바꿨다면 구매 복원을 누름'),
                       trailing: TextButton(
-                        onPressed: purchases.busy ? null : purchases.restore,
+                        onPressed: purchases.busy ? null : () => _restorePurchases(purchases),
                         child: const Text('구매 복원'),
                       ),
                     ),
+                    if (!purchases.unlocked && purchases.product != null)
+                      ListTile(
+                        leading: const Icon(Icons.shopping_bag_outlined),
+                        title: const Text('메트로놈 잠금 해제'),
+                        trailing: FilledButton(
+                          onPressed: purchases.busy ? null : purchases.buy,
+                          child: Text(purchases.product!.price),
+                        ),
+                      ),
+                    if (purchases.lastError != null)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: kGapL),
+                        child: Text(
+                          purchases.lastError!,
+                          style: TextStyle(color: Theme.of(context).colorScheme.error),
+                        ),
+                      ),
                     if (wallet.available) ...[
                       const Divider(),
                       const SectionHeader('코인'),
@@ -446,10 +581,6 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 }
-
-/// 키 이름을 사람이 읽을 수 있게. 이름이 없는 키는 코드로 보여 줌.
-String _keyLabel(LogicalKeyboardKey key) =>
-    key.keyLabel.isNotEmpty ? key.keyLabel : key.debugName ?? '키 ${key.keyId}';
 
 /// 페달을 한 번 밟으면 그 키를 돌려주는 대화상자.
 /// 여기서만 키를 먹으므로 배우는 동안 화면이 넘어가지 않음.

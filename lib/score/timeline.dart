@@ -81,14 +81,32 @@ class Timeline {
     required this.countInBars,
   });
 
-  /// 주어진 시각이 속한 스팬 인덱스. 카운트인 구간이나 끝을 넘으면 -1.
+  /// 주어진 시각이 속한 스팬 인덱스. 카운트인 구간이나 끝을 넘으면 -1. 길이 0인 스팬은 걸리지 않음.
+  /// Duration에서 온 시각은 경계 바로 앞으로 반올림될 수 있으니 kTimeEpsilon을 더해 넘김.
   int spanIndexAt(double t) {
     for (var i = 0; i < spans.length; i++) {
       if (t >= spans[i].start && t < spans[i].end) return i;
     }
     return -1;
   }
+
+  /// i에서 step(1은 뒤로, -1은 앞으로) 방향으로 찾은 첫 실제 스팬. 없으면 -1.
+  /// 표지처럼 연주가 없는 0마디 쪽은 화면에 세우지 않으므로 보여 줄 스팬을 고를 때 씀.
+  int playedSpan(int i, {int step = 1}) {
+    for (var j = i; j >= 0 && j < spans.length; j += step) {
+      if (spans[j].duration > 0) return j;
+    }
+    return -1;
+  }
+
+  /// 재생 중 스팬 i에서 step(1은 다음, -1은 이전) 방향으로 실제로 서는 이웃 스팬. 없으면 -1.
+  /// 0마디 스팬은 건너뜀. 자동 넘김·재생 중 넘김·넘김 예고가 모두 이 이웃을 써서 서로 어긋나지 않음.
+  int playedNeighbor(int i, {int step = 1}) => playedSpan(i + step, step: step);
 }
+
+/// Duration(µs)과 초(double)를 오가며 생기는 반올림 오차(최대 0.5µs)를 덮는 허용치.
+/// 스팬 시작으로 건너뛴 위치가 경계 바로 앞으로 떨어져 앞 스팬·앞 마디로 판정되는 것을 막음.
+const kTimeEpsilon = 1e-6;
 
 /// 다룰 수 있는 템포 범위. 0이나 음수, NaN이 들어오면 한 박이 무한대가 되어
 /// 타임라인 전체가 NaN이 되고 secondsToDuration에서 앱이 죽음.
@@ -128,11 +146,13 @@ Timeline buildTimeline(ScoreTiming s) {
   final spans = <PageSpan>[];
   var t = 0.0;
 
-  // 카운트인은 첫 재생 페이지의 템포를 따름. 페이지가 없으면 악보 기본값.
-  final headBpm = safeBpm(order.isEmpty ? s.bpm : (s.pages[order.first].bpm ?? s.bpm));
-  final headCpb = safeClicksPerBar(
-    order.isEmpty ? s.clicksPerBar : (s.pages[order.first].clicksPerBar ?? s.clicksPerBar),
-  );
+  // 카운트인은 첫 연주 페이지의 템포·박을 따름. 맨 앞 표지(0마디)는 카운트인 동안 그 페이지로 대신하므로
+  // 표지 값을 쓰면 첫 쪽 고정값과 다른 템포로 들어감. 연주 페이지가 없으면 첫 페이지, 페이지가 없으면 악보 기본값.
+  final head = order.isEmpty
+      ? null
+      : s.pages[order.firstWhere((i) => s.pages[i].barCount > 0, orElse: () => order.first)];
+  final headBpm = safeBpm(head?.bpm ?? s.bpm);
+  final headCpb = safeClicksPerBar(head?.clicksPerBar ?? s.clicksPerBar);
   final headBeat = 60.0 / headBpm;
   final countInBars = s.countInBars < 0 ? 0 : s.countInBars;
   for (var i = 0; i < countInBars * headCpb; i++) {
@@ -182,10 +202,17 @@ Timeline buildTimeline(ScoreTiming s) {
 
 /// 재생 위치에 맞는 스팬 인덱스를 앞으로만 전진시켜 찾음.
 /// 프레임이 밀려 여러 페이지를 한 번에 지나쳐도 따라잡음. 되감기는 spanIndexAt을 씀.
+/// 0마디 스팬에는 머물지 않음. 앞 페이지의 선행 넘김이 다음 실제 페이지로 곧바로 이어지고,
+/// 뒤에 실제 페이지가 없으면 넘기지 않아 마지막 페이지가 끝까지 보임.
 int advanceSpan(Timeline tl, int current, double nowSec) {
   var i = current < 0 ? 0 : current;
-  while (i + 1 < tl.spans.length && nowSec >= tl.spans[i].turnAt) {
-    i++;
+  final first = tl.playedSpan(i);
+  if (first < 0) return i;
+  i = first;
+  while (nowSec >= tl.spans[i].turnAt) {
+    final next = tl.playedNeighbor(i);
+    if (next < 0) break;
+    i = next;
   }
   return i;
 }

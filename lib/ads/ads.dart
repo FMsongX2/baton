@@ -127,6 +127,7 @@ abstract final class Ads {
 /// MaterialApp.builder에서 Navigator를 감싸 화면 아래에 배너 칸을 붙임.
 /// 칸 높이만큼 본문의 하단 여백·키보드 인셋을 덜어 이중으로 밀리지 않게 함.
 class AdFrame extends StatelessWidget {
+  /// child는 MaterialApp.builder가 넘긴 Navigator.
   const AdFrame({super.key, required this.child});
 
   /// MaterialApp이 넘긴 Navigator. 감싸는 트리 모양이 바뀌면 경로 스택이 새로 만들어지므로 모양을 고정함.
@@ -202,8 +203,10 @@ class _ModalObserver extends NavigatorObserver {
 
 /// 하단 배너 칸. 광고가 오기 전에도 자리를 먼저 잡아 뒤늦게 본문이 밀리며 오터치가 나지 않게 함.
 class BannerSlot extends StatefulWidget {
+  /// 앱 루트에 하나만 둠. 같은 광고를 두 곳에 붙이면 AdWidget이 예외를 던짐.
   const BannerSlot({super.key});
 
+  /// 광고와 재요청 타이머를 쥐는 상태를 만듦.
   @override
   State<BannerSlot> createState() => _BannerSlotState();
 }

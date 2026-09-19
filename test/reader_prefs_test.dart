@@ -26,6 +26,12 @@ void main() {
     expect(p.clickOn, isTrue);
     expect(p.tool, ReaderTool.pen);
     expect(p.color, kDefaultPenColor);
+    expect(p.locked, isFalse);
+  });
+
+  test('터치 잠금은 저장되어 다음 곡에서도 켜진 채로 열림', () async {
+    await settings.setBool(kReaderLockKey, true);
+    expect((await loadReaderPrefs(settings)).locked, isTrue);
   });
 
   test('두 장씩을 끄면 자동과 구분됨', () async {

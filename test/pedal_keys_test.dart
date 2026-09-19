@@ -53,4 +53,23 @@ void main() {
     final loaded = await loadPedalKeys(settings);
     expect(loaded.directionOf(LogicalKeyboardKey.space), 1);
   });
+
+  test('기본 넘김 키는 모두 한국어 이름으로 보이고 스페이스도 빈칸이 아님', () {
+    expect(pedalKeyLabel(LogicalKeyboardKey.space), '스페이스');
+    expect(pedalKeyLabel(LogicalKeyboardKey.arrowRight), '오른쪽 화살표');
+    for (final k in [...kDefaultNextKeys, ...kDefaultPrevKeys]) {
+      expect(pedalKeyLabel(k).trim(), isNotEmpty);
+    }
+  });
+
+  test('표에 없는 키는 키보드 표기를 씀', () {
+    expect(pedalKeyLabel(LogicalKeyboardKey.keyA), 'A');
+    expect(pedalKeyLabel(LogicalKeyboardKey.f13), 'F13');
+  });
+
+  test('표기가 공백이거나 없는 키는 키 코드로 보임', () {
+    // U+3000은 표기가 전각 공백 한 칸, 0x1100000042는 표기가 아예 없는 키
+    expect(pedalKeyLabel(const LogicalKeyboardKey(0x3000)), '키 0x3000');
+    expect(pedalKeyLabel(const LogicalKeyboardKey(0x1100000042)), '키 0x1100000042');
+  });
 }

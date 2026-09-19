@@ -24,7 +24,9 @@ Path strokePath(Stroke s, Size pageSize) {
       PointVector(
         p.dx * pageSize.width,
         p.dy * pageSize.height,
-        s.pressures != null && i < s.pressures!.length ? s.pressures![i] : null,
+        // 필압은 0~1로 저장하지만, 예전 획에는 기기 원시값(Apple Pencil은 4 넘음)이 남아 있음.
+        // perfect_freehand는 1을 넘는 값을 자르지 않아 굵기가 설정의 몇 배가 되므로 여기서 접음
+        s.pressures != null && i < s.pressures!.length ? s.pressures![i].clamp(0.0, 1.0) : null,
       ),
     );
   }

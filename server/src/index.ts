@@ -1,16 +1,24 @@
 // 앱이 부르는 HTTP 진입점. 코인 원장과 OpenAI 키를 서버에만 두기 위해 존재함.
-// 분석은 코인을 먼저 빼고 실패하면 되돌려 준다. 먼저 빼야 동시에 눌러도 잔액이 무너지지 않음.
+// 분석은 requestId를 선점하며 코인을 먼저 빼고, 실패하면 선점한 요청만 한 번 되돌려 줌(analyses.ts).
 
 import * as z from 'zod/v4';
 import { analyzeScore, type PageImage } from './analyze.js';
 import {
+  abandonAnalysis,
+  claimAnalysis,
+  completeAnalysis,
+  refundStaleAnalyses,
+} from './analyses.js';
+import {
   authenticate,
   claimRegistrationSlot,
+  confirmRecoveryCode,
+  normalizeRecoveryCode,
   registerDevice,
   reissueRecoveryCode,
   restoreDevice,
 } from './auth.js';
-import { balanceOf, grant, grantStatements, spend } from './coins.js';
+import { balanceOf, grantStatements } from './coins.js';
 import { coinsPerPage, type Env } from './env.js';
 import { COIN_PACKS, verifyPurchase } from './receipts.js';
 
@@ -23,21 +31,45 @@ const MAX_PAGES_PER_CALL = 8;
 /// 본문 하나가 워커 메모리를 통째로 먹지 않게 막음.
 const MAX_IMAGE_BASE64 = 12_000_000;
 
+/// 형식별 파일 첫 바이트. 깨진 본문을 코인 차감과 모델 호출 전에 걸러 냄.
+const IMAGE_SIGNATURES: Record<'image/png' | 'image/jpeg', number[]> = {
+  'image/png': [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
+  'image/jpeg': [0xff, 0xd8, 0xff],
+};
+
+/// base64가 올바른 문자·길이이고, 풀면 선언한 형식의 서명으로 시작하는지.
+function isImage(page: { mediaType: 'image/png' | 'image/jpeg'; base64: string }): boolean {
+  if (page.base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(page.base64)) return false;
+  const head = atob(page.base64.slice(0, 12));
+  return IMAGE_SIGNATURES[page.mediaType].every((b, i) => head.charCodeAt(i) === b);
+}
+
 /// 분석 요청 본문. 인증된 사용자라도 잘못된 모양이 코인 차감까지 흘러가면 안 되므로
-/// spend 앞에서 전부 검사함.
+/// 선점 앞에서 전부 검사함.
 const AnalyzeRequest = z.object({
   requestId: z.string().min(8).max(128),
   pages: z
     .array(
-      z.object({
-        index: z.number().int().min(0).max(9999),
-        mediaType: z.enum(['image/png', 'image/jpeg']),
-        base64: z.string().min(1).max(MAX_IMAGE_BASE64),
-      }),
+      z
+        .object({
+          index: z.number().int().min(0).max(9999),
+          mediaType: z.enum(['image/png', 'image/jpeg']),
+          base64: z.string().min(1).max(MAX_IMAGE_BASE64),
+        })
+        .refine(isImage, '이미지가 깨짐'),
     )
     .min(1)
     .max(MAX_PAGES_PER_CALL),
 });
+
+/// 복구 코드를 담은 본문을 읽어 발급 모양으로 맞춤. 모양이 틀리면 400으로 떨어뜨림.
+async function readRecoveryCode(request: Request): Promise<string> {
+  const body = (await readJson(request)) as { recoveryCode?: unknown };
+  const code =
+    typeof body?.recoveryCode === 'string' ? normalizeRecoveryCode(body.recoveryCode) : null;
+  if (!code) throw new BadRequest('복구 코드는 XXXX-XXXX-XXXX 모양의 12자임');
+  return code;
+}
 
 /// JSON 응답을 만듦.
 function json(body: unknown, status = 200): Response {
@@ -78,15 +110,13 @@ export default {
       }
 
       if (request.method === 'POST' && path === '/v1/device/restore') {
+        // 모양이 틀린 입력은 맞을 수 없으므로 한도를 쓰기 전에 거름
+        const code = await readRecoveryCode(request);
         // 인증 없이 서버 상태를 바꾸는 유일한 경로라 등록과 같은 회선 제한을 검
         if (!(await claimRegistrationSlot(env, request, 'restore'))) {
           return fail('오늘 이 회선에서 시도할 수 있는 횟수를 넘음', 429);
         }
-        const body = (await readJson(request)) as { recoveryCode?: unknown };
-        if (typeof body?.recoveryCode !== 'string' || !body.recoveryCode) {
-          return fail('복구 코드가 없음', 400);
-        }
-        const restored = await restoreDevice(env, body.recoveryCode);
+        const restored = await restoreDevice(env, code);
         if (!restored) return fail('복구 코드를 찾을 수 없음', 404);
         return json(restored);
       }
@@ -106,7 +136,16 @@ export default {
         return json({ recoveryCode: await reissueRecoveryCode(env, user.id) });
       }
 
+      if (request.method === 'POST' && path === '/v1/device/recovery/confirm') {
+        if (!(await confirmRecoveryCode(env, user.id, await readRecoveryCode(request)))) {
+          return fail('그사이 다른 코드가 발급됨. 복구 코드를 다시 받음', 409);
+        }
+        return json({ confirmed: true });
+      }
+
       if (request.method === 'GET' && path === '/v1/balance') {
+        // 앱이 끝내 다시 보내지 않은 분석도 여기서 돌려받게 함
+        await refundStaleAnalyses(env, user.id);
         return json({ balance: (await balanceOf(env, user.id)) ?? 0 });
       }
 
@@ -189,55 +228,55 @@ async function isRedeemed(env: Env, purchaseToken: string): Promise<boolean> {
   return row !== null;
 }
 
-/// 코인을 먼저 빼고 분석함. 분석이 실패하면 뺀 만큼 그대로 되돌려 줌.
+/// requestId를 선점하며 코인을 빼고 분석함. 같은 id가 다시 오면 차감 없이 저장된 결과를 주거나
+/// 진행 중(409)이라고 알림. 분석이 실패하면 선점한 요청만 전액 되돌려 주고,
+/// 모델이 빠뜨린 쪽은 그 몫만 되돌려 줌.
 async function handleAnalyze(env: Env, request: Request, userId: string): Promise<Response> {
   const parsed = AnalyzeRequest.safeParse(await readJson(request));
   if (!parsed.success) {
     return fail(`분석 요청이 잘못됨: ${parsed.error.issues[0]?.message ?? ''}`, 400);
   }
   const { requestId, pages } = parsed.data;
+  const cost = pages.length * coinsPerPage(env);
 
-  // 같은 요청이 다시 오면 코인을 또 빼지 않음. 응답이 도중에 끊겨도 결과를 되찾을 수 있어야 함
-  const prior = await env.DB.prepare(
-    'SELECT cost, result FROM analyses WHERE request_id = ? AND user_id = ?',
-  )
-    .bind(requestId, userId)
-    .first<{ cost: number; result: string | null }>();
-
-  let cost: number;
-  if (prior) {
-    if (prior.result) {
+  const claim = await claimAnalysis(
+    env,
+    userId,
+    requestId,
+    pages.map((p) => p.index).join(','),
+    cost,
+  );
+  switch (claim.kind) {
+    case 'insufficient':
+      return json({ error: '코인이 모자람', needed: cost, balance: claim.balance }, 402);
+    case 'mismatch':
+      return fail('같은 요청 id로 다른 쪽을 보냄', 422);
+    case 'running':
+      return json({ error: '같은 분석이 아직 진행 중. 잠시 뒤 다시 시도', pending: true }, 409);
+    case 'done': {
       const balance = (await balanceOf(env, userId)) ?? 0;
-      return json({ ...JSON.parse(prior.result), coinsSpent: prior.cost, balance });
+      return json({ ...JSON.parse(claim.result), coinsSpent: claim.cost, balance });
     }
-    // 앞서 코인만 빠지고 끝난 요청. 다시 빼지 않고 분석만 이어서 함
-    cost = prior.cost;
-  } else {
-    cost = pages.length * coinsPerPage(env);
-    const afterSpend = await spend(env, userId, cost, 'analyze', requestId);
-    if (afterSpend === null) {
-      const balance = (await balanceOf(env, userId)) ?? 0;
-      return json({ error: '코인이 모자람', needed: cost, balance }, 402);
-    }
-    await env.DB.prepare(
-      'INSERT INTO analyses (request_id, user_id, cost, result, created_at) VALUES (?, ?, ?, NULL, ?)',
-    )
-      .bind(requestId, userId, cost, Date.now())
-      .run();
   }
 
+  let analysis;
   try {
-    const analysis = await analyzeScore(env, pages as PageImage[]);
-    await env.DB.prepare('UPDATE analyses SET result = ? WHERE request_id = ?')
-      .bind(JSON.stringify(analysis), requestId)
-      .run();
-    const balance = (await balanceOf(env, userId)) ?? 0;
-    return json({ ...analysis, coinsSpent: cost, balance });
+    analysis = await analyzeScore(env, pages as PageImage[]);
   } catch (e) {
-    // 되돌려 주고 기록도 지움. 남겨 두면 재시도가 "코인은 이미 뺐다"고 오해함
-    const balance = await grant(env, userId, cost, 'analyze_refund', requestId);
-    await env.DB.prepare('DELETE FROM analyses WHERE request_id = ?').bind(requestId).run();
     console.error(e);
-    return json({ error: '분석에 실패해 코인을 돌려줌', balance }, 502);
+    const refunded = await abandonAnalysis(env, userId, requestId, claim.claim);
+    const balance = (await balanceOf(env, userId)) ?? 0;
+    return json({ error: refunded ? '분석에 실패해 코인을 돌려줌' : '분석에 실패함', balance }, 502);
   }
+
+  // 요청한 쪽 중 결과가 없는 만큼 돌려줌. analyzeScore가 요청 밖·중복 쪽을 이미 걸러 냄
+  const missing = pages.length - analysis.pages.length;
+  const refund = Math.round((claim.cost * missing) / pages.length);
+  const result = JSON.stringify(analysis);
+  if (!(await completeAnalysis(env, userId, requestId, claim.claim, result, refund))) {
+    // 기한이 지나 환불되고 선점을 잃음. 결과를 공짜로 내주지 않고 다시 보내게 함
+    return json({ error: '분석이 너무 오래 걸려 취소됨. 다시 시도', pending: true }, 409);
+  }
+  const balance = (await balanceOf(env, userId)) ?? 0;
+  return json({ ...analysis, coinsSpent: claim.cost - refund, balance });
 }

@@ -1,5 +1,6 @@
 // 휴지통. 삭제는 곧바로 파일을 지우지 않으므로 여기서 되살리거나 완전히 지움.
 // 보관 기간이 지난 항목은 앱을 열 때 자동으로 사라지고, 여기서 먼저 지울 수도 있음.
+// 목록은 DB 감시 쿼리라 여기서 되살리거나 지운 결과가 라이브러리 화면에도 같은 경로로 반영됨.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -18,17 +19,18 @@ class TrashPage extends ConsumerStatefulWidget {
 }
 
 class _TrashPageState extends ConsumerState<TrashPage> {
-  late Future<List<Node>> _future;
+  late Stream<List<Node>> _stream;
   bool _busy = false;
 
+  /// 휴지통 목록 감시를 검.
   @override
   void initState() {
     super.initState();
-    _future = ref.read(libraryRepoProvider).trash();
+    _stream = ref.read(libraryRepoProvider).watchTrash();
   }
 
-  /// 목록을 다시 읽음.
-  void _reload() => setState(() => _future = ref.read(libraryRepoProvider).trash());
+  /// 감시를 새로 검. 읽기에 실패했을 때 다시 시도하는 데 씀.
+  void _reload() => setState(() => _stream = ref.read(libraryRepoProvider).watchTrash());
 
   /// 남은 보관 일수. 0 이하면 다음에 앱을 열 때 사라짐.
   int _daysLeft(DateTime deletedAt) =>
@@ -57,7 +59,7 @@ class _TrashPageState extends ConsumerState<TrashPage> {
     return ok == true;
   }
 
-  /// 고른 항목을 파일까지 완전히 지움.
+  /// 고른 항목을 파일까지 완전히 지움. 목록은 감시 쿼리가 알아서 갱신함.
   Future<void> _purge(List<int> ids, String message) async {
     if (_busy || ids.isEmpty) return;
     final messenger = ScaffoldMessenger.of(context);
@@ -65,7 +67,6 @@ class _TrashPageState extends ConsumerState<TrashPage> {
     setState(() => _busy = true);
     try {
       await ref.read(libraryRepoProvider).purge(ids);
-      if (mounted) _reload();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('삭제 실패: $e')));
     } finally {
@@ -79,8 +80,8 @@ class _TrashPageState extends ConsumerState<TrashPage> {
     body: SafeArea(
       top: false,
       child: ContentWidth(
-        child: FutureBuilder<List<Node>>(
-          future: _future,
+        child: StreamBuilder<List<Node>>(
+          stream: _stream,
           builder: (_, snap) {
             if (snap.hasError) {
               return EmptyState(
@@ -125,12 +126,7 @@ class _TrashPageState extends ConsumerState<TrashPage> {
         mainAxisSize: MainAxisSize.min,
         children: [
           TextButton(
-            onPressed: _busy
-                ? null
-                : () async {
-                    await ref.read(libraryRepoProvider).restore([n.id]);
-                    if (mounted) _reload();
-                  },
+            onPressed: _busy ? null : () => ref.read(libraryRepoProvider).restore([n.id]),
             child: const Text('되살리기'),
           ),
           IconButton(

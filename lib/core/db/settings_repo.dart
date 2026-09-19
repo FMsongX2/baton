@@ -39,5 +39,10 @@ class SettingsRepo {
 /// 출력 지연 보정(ms). 블루투스 이어폰은 소리가 늦게 나므로 그만큼 클릭을 앞당김.
 const kLatencyMsKey = 'latency_ms';
 
+/// 이 기기에만 맞는 설정. 백업을 되살려도 백업 쪽 값 대신 이 기기 값을 그대로 둠.
+/// 출력 지연은 이어폰·스피커 조합마다 달라 다른 기기 값을 쓰면 클릭이 어긋나거나 빠짐.
+/// 구매 캐시는 이 기기 스토어 계정의 것이라, 남이 만든 백업으로 들어오면 구매 없이 풀림.
+const kDeviceLocalKeys = {kLatencyMsKey, kMetronomeUnlockedKey};
+
 /// 메트로놈 구매 여부 캐시. 스토어 확인 전에 화면을 그리기 위한 것이며 진실은 스토어에 있음.
 const kMetronomeUnlockedKey = 'metronome_unlocked';

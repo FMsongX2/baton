@@ -32,6 +32,14 @@ function randomRecoveryCode(): string {
     .join('-');
 }
 
+/// 입력한 복구 코드를 발급 모양(XXXX-XXXX-XXXX)으로 맞춤. 대시·공백·대소문자는 무시하고,
+/// 발급 문자 12자가 아니면 null. 발급 때 대시를 넣은 모양을 해시했으므로 같은 모양으로 맞춰야 찾음.
+export function normalizeRecoveryCode(input: string): string | null {
+  const chars = input.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (chars.length !== 12 || [...chars].some((c) => !RECOVERY_ALPHABET.includes(c))) return null;
+  return `${chars.slice(0, 4)}-${chars.slice(4, 8)}-${chars.slice(8)}`;
+}
+
 /// 비밀값을 SHA-256 hex로. 토큰·복구 코드는 이 값만 저장함.
 export async function hash(secret: string): Promise<string> {
   const data = new TextEncoder().encode(secret);
@@ -81,9 +89,10 @@ export async function registerDevice(env: Env) {
 }
 
 /// 복구 코드로 기존 사용자를 새 기기에 붙임. 옛 토큰은 무효가 되어 기기 하나만 남음.
+/// recoveryCode는 normalizeRecoveryCode를 거친 값이어야 함.
 export async function restoreDevice(env: Env, recoveryCode: string) {
   const row = await env.DB.prepare('SELECT id, balance FROM users WHERE recovery_hash = ?')
-    .bind(await hash(recoveryCode.trim().toUpperCase()))
+    .bind(await hash(recoveryCode))
     .first<{ id: string; balance: number }>();
   if (!row) return null;
 
@@ -95,14 +104,37 @@ export async function restoreDevice(env: Env, recoveryCode: string) {
   return { userId: row.id, token, balance: row.balance };
 }
 
-/// 복구 코드를 새로 발급하고 해시를 갈아 끼움. 이전 코드는 이 순간부터 통하지 않음.
+/// 복구 코드를 새로 발급해 대기 칸에만 넣음. confirmRecoveryCode 전까지 이전 코드가 그대로 통함.
 /// 서버가 해시만 들고 있어 이미 발급한 코드를 다시 보여 줄 방법이 없으므로 재발급으로 대신함.
+/// 바로 갈아 끼우면 응답이 유실됐을 때 사용자는 새 코드를 못 받았는데 이전 코드만 죽음.
 export async function reissueRecoveryCode(env: Env, userId: string): Promise<string> {
   const recoveryCode = randomRecoveryCode();
-  await env.DB.prepare('UPDATE users SET recovery_hash = ? WHERE id = ?')
+  await env.DB.prepare('UPDATE users SET pending_recovery_hash = ? WHERE id = ?')
     .bind(await hash(recoveryCode), userId)
     .run();
   return recoveryCode;
+}
+
+/// 사용자가 받아 적었다고 확인한 대기 코드를 적용함. 이 순간부터 이전 코드는 통하지 않음.
+/// 같은 코드로 다시 불러도 이미 적용됐으면 true라 응답이 유실돼 재시도해도 안전함.
+/// 그사이 다른 코드가 발급돼 대기 칸이 바뀌었으면 false.
+export async function confirmRecoveryCode(
+  env: Env,
+  userId: string,
+  recoveryCode: string,
+): Promise<boolean> {
+  const hashed = await hash(recoveryCode);
+  const [, active] = await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE users SET recovery_hash = pending_recovery_hash, pending_recovery_hash = NULL ' +
+        'WHERE id = ? AND pending_recovery_hash = ?',
+    ).bind(userId, hashed),
+    env.DB.prepare('SELECT 1 AS ok FROM users WHERE id = ? AND recovery_hash = ?').bind(
+      userId,
+      hashed,
+    ),
+  ]);
+  return active.results.length > 0;
 }
 
 /// Authorization 헤더의 토큰으로 사용자를 찾음. 없으면 null.

@@ -162,6 +162,69 @@ void _advanceTests() {
     expect(advanceSpan(t, 0, 0.5), 0);
     expect(advanceSpan(t, 0, 1.9), 0);
   });
+
+  group('0마디 쪽', () {
+    /// 표지처럼 연주가 없는 쪽은 0마디로 들어와 바로 넘어가야 함. 머물면 카운트인 동안 표지가
+    /// 화면을 차지하고, 곡 중간이면 앞 페이지의 선행 넘김을 빈 쪽이 가로챔.
+    test('맨 앞 표지는 카운트인 중에도 건너뛰어 첫 연주 페이지에 섬', () {
+      final t = buildTimeline(
+        score(
+          countInBars: 1,
+          leadBeats: 2,
+          pages: const [PageTiming(barCount: 0), PageTiming(barCount: 4), PageTiming(barCount: 4)],
+        ),
+      );
+      expect(advanceSpan(t, 0, 0.5), 1);
+      expect(t.playedSpan(0), 1);
+    });
+
+    test('곡 중간의 빈 쪽은 앞 페이지의 선행 넘김이 다음 실제 페이지로 바로 이어짐', () {
+      final t = buildTimeline(
+        score(
+          leadBeats: 2,
+          pages: const [PageTiming(barCount: 4), PageTiming(barCount: 0), PageTiming(barCount: 4)],
+        ),
+      );
+      expect(advanceSpan(t, 0, t.spans[0].turnAt - 0.01), 0);
+      expect(advanceSpan(t, 0, t.spans[0].turnAt), 2);
+    });
+
+    test('뒤에 실제 페이지가 없으면 빈 쪽으로 넘기지 않아 마지막 페이지가 끝까지 보임', () {
+      final t = buildTimeline(
+        score(leadBeats: 2, pages: const [PageTiming(barCount: 4), PageTiming(barCount: 0)]),
+      );
+      expect(advanceSpan(t, 0, 999.0), 0);
+    });
+
+    test('맨 앞 표지가 있어도 카운트인은 첫 연주 페이지의 템포·박으로 셈', () {
+      // 카운트인 동안 보이는 쪽은 첫 연주 페이지. 표지(곡 설정 120bpm 4박) 값으로 세면 첫 쪽 고정값과 어긋남
+      final t = buildTimeline(
+        score(
+          countInBars: 1,
+          pages: const [PageTiming(barCount: 0), PageTiming(barCount: 4, bpm: 60, clicksPerBar: 3)],
+        ),
+      );
+      expect(t.clicks.take(3).map((c) => c.time), [0.0, 1.0, 2.0]);
+      expect(t.countInEnd, closeTo(3.0, 1e-9));
+    });
+
+    test('실제 스팬을 앞뒤 어느 쪽으로도 찾음', () {
+      final t = buildTimeline(
+        score(
+          pages: const [
+            PageTiming(barCount: 1),
+            PageTiming(barCount: 0),
+            PageTiming(barCount: 0),
+            PageTiming(barCount: 1),
+          ],
+        ),
+      );
+      expect(t.playedSpan(1), 3);
+      expect(t.playedSpan(2, step: -1), 0);
+      expect(t.playedSpan(4), -1);
+      expect(t.spanIndexAt(t.spans[1].start), 3, reason: '길이 0인 스팬은 위치로 걸리지 않음');
+    });
+  });
 }
 
 void _metronomeTests() {

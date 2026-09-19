@@ -42,66 +42,77 @@ class DrawToolbar extends StatelessWidget {
   final VoidCallback onUndo;
   final VoidCallback onRedo;
 
+  /// 도구·색·굵기는 가로로 밀어 보고, 실행취소·다시 실행은 오른쪽에 고정해 그림.
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return SizedBox(
       height: 56,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: kGapS),
-        child: Row(
-          children: [
-            for (final t in ReaderTool.values)
-              IconButton(
-                tooltip: switch (t) {
-                  ReaderTool.pen => '펜',
-                  ReaderTool.highlighter => '형광펜',
-                  ReaderTool.eraser => '지우개',
-                },
-                isSelected: tool == t,
-                icon: Icon(switch (t) {
-                  ReaderTool.pen => Icons.edit_outlined,
-                  ReaderTool.highlighter => Icons.brush_outlined,
-                  ReaderTool.eraser => Icons.cleaning_services_outlined,
-                }),
-                onPressed: () => onTool(t),
+      // 실행취소·다시 실행은 스크롤 밖 오른쪽에 고정함. 한 줄에 다 넣으면 폰 세로에서 화면 밖으로 밀려
+      // 밀 수 있다는 단서도 없이 숨어 버림
+      child: Row(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.only(left: kGapS),
+              child: Row(
+                children: [
+                  for (final t in ReaderTool.values)
+                    IconButton(
+                      tooltip: switch (t) {
+                        ReaderTool.pen => '펜',
+                        ReaderTool.highlighter => '형광펜',
+                        ReaderTool.eraser => '지우개',
+                      },
+                      isSelected: tool == t,
+                      icon: Icon(switch (t) {
+                        ReaderTool.pen => Icons.edit_outlined,
+                        ReaderTool.highlighter => Icons.brush_outlined,
+                        ReaderTool.eraser => Icons.cleaning_services_outlined,
+                      }),
+                      onPressed: () => onTool(t),
+                    ),
+                  const _Sep(),
+                  for (final c in kPenColors)
+                    _ColorDot(color: c, selected: color == c, onTap: () => onColor(c)),
+                  const _Sep(),
+                  for (final w in kPenWidths)
+                    IconButton(
+                      // 도형만 있어 스크린리더가 구분하지 못함
+                      tooltip: _widthLabel(w),
+                      isSelected: width == w,
+                      icon: Container(
+                        width: 6 + w * 2400,
+                        height: 6 + w * 2400,
+                        decoration: BoxDecoration(color: scheme.onSurface, shape: BoxShape.circle),
+                      ),
+                      onPressed: () => onWidth(w),
+                    ),
+                  const _Sep(),
+                  IconButton(
+                    tooltip: '스타일러스만 받기',
+                    isSelected: stylusOnly,
+                    icon: const Icon(Icons.back_hand_outlined),
+                    onPressed: onStylusOnly,
+                  ),
+                ],
               ),
-            const _Sep(),
-            for (final c in kPenColors)
-              _ColorDot(color: c, selected: color == c, onTap: () => onColor(c)),
-            const _Sep(),
-            for (final w in kPenWidths)
-              IconButton(
-                // 도형만 있어 스크린리더가 구분하지 못함
-                tooltip: _widthLabel(w),
-                isSelected: width == w,
-                icon: Container(
-                  width: 6 + w * 2400,
-                  height: 6 + w * 2400,
-                  decoration: BoxDecoration(color: scheme.onSurface, shape: BoxShape.circle),
-                ),
-                onPressed: () => onWidth(w),
-              ),
-            const _Sep(),
-            IconButton(
-              tooltip: '스타일러스만 받기',
-              isSelected: stylusOnly,
-              icon: const Icon(Icons.back_hand_outlined),
-              onPressed: onStylusOnly,
             ),
-            IconButton(
-              tooltip: '실행취소',
-              icon: const Icon(Icons.undo),
-              onPressed: canUndo ? onUndo : null,
-            ),
-            IconButton(
-              tooltip: '다시 실행',
-              icon: const Icon(Icons.redo),
-              onPressed: canRedo ? onRedo : null,
-            ),
-          ],
-        ),
+          ),
+          const _Sep(),
+          IconButton(
+            tooltip: '실행취소',
+            icon: const Icon(Icons.undo),
+            onPressed: canUndo ? onUndo : null,
+          ),
+          IconButton(
+            tooltip: '다시 실행',
+            icon: const Icon(Icons.redo),
+            onPressed: canRedo ? onRedo : null,
+          ),
+          const SizedBox(width: kGapS),
+        ],
       ),
     );
   }

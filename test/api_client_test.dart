@@ -1,5 +1,7 @@
-// 서버 응답 해석 검증. 코인이 모자란 응답을 오류로만 흘리면 사용자에게 얼마가 필요한지 알릴 수 없음.
+// 서버 응답 해석과 분석 재전송 검증. 코인이 모자란 응답을 오류로만 흘리면 얼마가 필요한지 알릴 수 없고,
+// 결과를 못 받은 분석을 새 id로 다시 보내면 코인이 또 빠지므로 같은 id로 다시 보내야 함.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -94,4 +96,147 @@ void main() {
     );
     expect(() => api.balance('t'), throwsA(isA<ApiException>()));
   });
+
+  test('전송이 끊기면 같은 requestId로 다시 보내 결과를 받음', () async {
+    final s = analyzeServer([http.ClientException('끊김'), (200, _analysisOk)]);
+    final res = await s.api.analyze(
+      't',
+      requestId: 'req-9',
+      pages: [(index: 0, png: Uint8List(0))],
+    );
+    expect(s.ids, ['req-9', 'req-9']);
+    expect(res.bpmUnit, 'quarter');
+  });
+
+  test('서버가 같은 분석을 처리 중이면 기다렸다가 같은 id로 다시 물음', () async {
+    final s = analyzeServer([
+      (409, {'error': '같은 분석이 아직 진행 중', 'pending': true}),
+      (200, _analysisOk),
+    ]);
+    await s.api.analyze('t', requestId: 'req-9', pages: [(index: 0, png: Uint8List(0))]);
+    expect(s.ids, ['req-9', 'req-9']);
+  });
+
+  test('코인이 모자라거나 환불을 마친 실패는 다시 보내지 않음', () async {
+    for (final status in [402, 502]) {
+      final s = analyzeServer([
+        (status, {'error': '거절', 'needed': 3, 'balance': 0}),
+      ]);
+      await expectLater(
+        s.api.analyze('t', requestId: 'req-9', pages: [(index: 0, png: Uint8List(0))]),
+        throwsA(isA<ApiException>()),
+      );
+      expect(s.ids, hasLength(1));
+    }
+  });
+
+  test('재시도 한도를 넘으면 마지막 오류를 던짐', () async {
+    final s = analyzeServer([for (var i = 0; i < 4; i++) http.ClientException('끊김')]);
+    await expectLater(
+      s.api.analyze('t', requestId: 'req-9', pages: [(index: 0, png: Uint8List(0))]),
+      throwsA(isA<ApiException>().having((e) => e.statusCode, 'statusCode', isNull)),
+    );
+    expect(s.ids, hasLength(4));
+  });
+
+  test('분석을 멈추면 응답을 기다리지 않고 멈춤을 던짐', () async {
+    final stop = Completer<void>();
+    var calls = 0;
+    final api = ApiClient(
+      baseUrl: 'https://example.test',
+      httpClient: MockClient((_) {
+        calls++;
+        return Completer<http.Response>().future; // 응답이 오지 않는 회선
+      }),
+    );
+    final running = api.analyze(
+      't',
+      requestId: 'req-9',
+      pages: [(index: 0, png: Uint8List(0))],
+      cancel: stop,
+    );
+    await Future<void>.delayed(Duration.zero);
+    stop.complete();
+    await expectLater(
+      running.timeout(const Duration(seconds: 1)),
+      throwsA(isA<AnalysisCancelled>()),
+    );
+    expect(calls, 1);
+  });
+
+  test('재전송을 기다리는 중에 멈추면 다시 보내지 않음', () async {
+    final stop = Completer<void>();
+    final ids = <String>[];
+    final api = ApiClient(
+      baseUrl: 'https://example.test',
+      analyzeRetryDelays: const [Duration(seconds: 30)],
+      httpClient: MockClient((req) async {
+        ids.add((jsonDecode(req.body) as Map<String, dynamic>)['requestId'] as String);
+        throw http.ClientException('끊김');
+      }),
+    );
+    final running = api.analyze(
+      't',
+      requestId: 'req-9',
+      pages: [(index: 0, png: Uint8List(0))],
+      cancel: stop,
+    );
+    while (ids.isEmpty) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    stop.complete();
+    await expectLater(
+      running.timeout(const Duration(seconds: 1)),
+      throwsA(isA<AnalysisCancelled>()),
+    );
+    expect(ids, ['req-9']);
+  });
+
+  test('복구 코드 확인은 받은 코드를 그대로 실어 보냄', () async {
+    late Map<String, dynamic> sent;
+    late String path;
+    final api = ApiClient(
+      baseUrl: 'https://example.test',
+      httpClient: MockClient((req) async {
+        path = req.url.path;
+        sent = jsonDecode(req.body) as Map<String, dynamic>;
+        return http.Response.bytes(utf8.encode(jsonEncode({'confirmed': true})), 200);
+      }),
+    );
+    await api.confirmRecoveryCode('t', 'ABCD-EFGH-JKLM');
+    expect(path, '/v1/device/recovery/confirm');
+    expect(sent['recoveryCode'], 'ABCD-EFGH-JKLM');
+  });
 }
+
+/// 분석 요청마다 실어 온 requestId를 모으고 응답을 차례대로 꺼내는 대역. 예외면 전송 실패로 던짐.
+({ApiClient api, List<String> ids}) analyzeServer(List<Object> replies) {
+  final ids = <String>[];
+  var i = 0;
+  final api = ApiClient(
+    baseUrl: 'https://example.test',
+    analyzeRetryDelays: const [Duration.zero, Duration.zero, Duration.zero],
+    httpClient: MockClient((req) async {
+      ids.add((jsonDecode(req.body) as Map<String, dynamic>)['requestId'] as String);
+      final reply = replies[i++];
+      if (reply is Exception) throw reply;
+      final (status, body) = reply as (int, Map<String, dynamic>);
+      return http.Response.bytes(utf8.encode(jsonEncode(body)), status);
+    }),
+  );
+  return (api: api, ids: ids);
+}
+
+const _analysisOk = <String, dynamic>{
+  'pages': [
+    {'page': 1, 'bars': 8, 'confidence': 'high'},
+  ],
+  'bpm': 144,
+  'bpmUnit': 'quarter',
+  'bpmSource': 'marking',
+  'timeSigNum': 2,
+  'timeSigDen': 2,
+  'coinsSpent': 1,
+  'balance': 7,
+};

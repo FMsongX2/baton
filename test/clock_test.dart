@@ -86,26 +86,39 @@ void main() {
     expect(secondsToDuration(2.0), const Duration(seconds: 2));
   });
 
+  test('시작·건너뛰기 기준점을 lead만큼 미래로 둠. 그동안 위치는 목표 앞에 머묾', () {
+    fake = const Duration(seconds: 10);
+    clock.start(const Duration(milliseconds: 150));
+    expect(clock.position, const Duration(milliseconds: -150));
+    expect(clock.engineTimeAt(Duration.zero), const Duration(milliseconds: 10150));
+
+    fake = const Duration(seconds: 12);
+    clock.seek(const Duration(seconds: 30), const Duration(milliseconds: 150));
+    expect(clock.position, const Duration(milliseconds: 29850));
+    expect(clock.engineTimeAt(const Duration(seconds: 30)), const Duration(milliseconds: 12150));
+  });
+
   group('엔진이 던질 때', () {
     /// 오디오 엔진이 도중에 죽으면 getEngineTime()이 던짐. 그대로 두면 매 프레임 예외가 나
     /// 소리뿐 아니라 페이지 자동 넘김까지 멈추므로, 시계가 스스로 물러서는지 고정함.
     test('예외를 밖으로 내보내지 않고 마지막 값을 유지함', () {
       var now = const Duration(seconds: 3);
       var alive = true;
-      final clock = withFallbackClock(() {
+      final clock = FallbackTime(() {
         if (!alive) throw StateError('엔진 내려감');
         return now;
       });
 
       expect(clock(), const Duration(seconds: 3));
       alive = false;
-      expect(clock, returnsNormally);
+      expect(clock.call, returnsNormally);
       expect(clock(), greaterThanOrEqualTo(const Duration(seconds: 3)));
+      expect(clock.fellBack, isTrue);
     });
 
     test('물러선 뒤에도 시간이 계속 흐름', () async {
       var alive = true;
-      final clock = withFallbackClock(() {
+      final clock = FallbackTime(() {
         if (!alive) throw StateError('엔진 내려감');
         return const Duration(seconds: 10);
       });
@@ -119,7 +132,7 @@ void main() {
     test('엔진이 살아나도 되돌아가지 않음. 두 시간축을 오가면 위치가 튐', () async {
       var alive = true;
       var engine = const Duration(seconds: 100);
-      final clock = withFallbackClock(() {
+      final clock = FallbackTime(() {
         if (!alive) throw StateError('엔진 내려감');
         return engine;
       });
@@ -132,6 +145,99 @@ void main() {
       alive = true;
       engine = const Duration(seconds: 9999);
       expect(clock(), lessThan(const Duration(seconds: 200)));
+    });
+  });
+
+  group('엔진 시각이 멈출 때', () {
+    /// 출력 장치가 멈추면(iOS 인터럽트, Android 재라우팅 실패) getEngineTime()은 던지지 않고
+    /// 같은 값만 돌려줌. 예외만 보면 자동 넘김이 그 자리에 얼어붙음.
+    const limit = Duration(milliseconds: 30);
+
+    test('멈춘 채로 한도를 넘기면 멈춘 자리부터 실제 시간으로 이어감', () async {
+      final clock = FallbackTime(() => const Duration(seconds: 7), stallLimit: limit);
+      expect(clock(), const Duration(seconds: 7));
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      final caughtUp = clock();
+      expect(clock.fellBack, isTrue);
+      expect(caughtUp, greaterThanOrEqualTo(const Duration(seconds: 7) + limit));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(clock(), greaterThan(caughtUp));
+    });
+
+    test('계단식으로 오르는 동안에는 물러서지 않음', () async {
+      var engine = const Duration(seconds: 1);
+      final clock = FallbackTime(() => engine, stallLimit: limit);
+      for (var i = 0; i < 6; i++) {
+        clock();
+        await Future<void>.delayed(const Duration(milliseconds: 15));
+        engine += const Duration(milliseconds: 15);
+      }
+      expect(clock.fellBack, isFalse);
+      expect(clock(), engine);
+    });
+
+    test('재생을 새로 시작하면 장치를 깨우고 엔진을 다시 따름', () async {
+      var engine = const Duration(seconds: 5);
+      var woke = 0;
+      final clock = FallbackTime(
+        () => engine,
+        stallLimit: limit,
+        wake: () {
+          woke++;
+          return true;
+        },
+      );
+      clock();
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      clock();
+      expect(clock.fellBack, isTrue);
+
+      engine = const Duration(seconds: 6);
+      clock.rearm();
+      expect(woke, 1);
+      expect(clock.fellBack, isFalse);
+      expect(clock(), const Duration(seconds: 6));
+    });
+
+    test('장치를 못 깨우면 한도를 기다리지 않고 바로 물러섬', () {
+      final clock = FallbackTime(() => const Duration(seconds: 5), wake: () => false);
+      clock();
+      clock.rearm();
+      expect(clock.fellBack, isTrue);
+    });
+
+    test('물러선 시계도 재생을 다시 시작하면 장치를 깨워 엔진을 따름', () async {
+      var woke = 0;
+      final clock = PlaybackClock.engine(
+        FallbackTime(
+          () => const Duration(seconds: 5),
+          stallLimit: limit,
+          wake: () {
+            woke++;
+            return true;
+          },
+        ),
+      );
+      clock.start();
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      clock.position;
+      expect(clock.followsEngine, isFalse);
+
+      clock.pause();
+      clock.start();
+      expect(woke, 2, reason: '시작할 때마다 장치를 깨움');
+      expect(clock.followsEngine, isTrue);
+    });
+
+    test('물러선 시계는 엔진 예약에 쓸 수 없다고 알림', () async {
+      final clock = PlaybackClock.engine(
+        FallbackTime(() => const Duration(seconds: 5), stallLimit: limit),
+      );
+      clock.start();
+      expect(clock.followsEngine, isTrue);
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      clock.position;
+      expect(clock.followsEngine, isFalse);
     });
   });
 }

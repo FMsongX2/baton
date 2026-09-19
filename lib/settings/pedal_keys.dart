@@ -1,4 +1,4 @@
-// 페달·키보드 넘김 키 매핑. BLE 페달은 HID 키보드로 들어오므로 어떤 키를 보내는지는 기기마다 다름.
+// 페달·키보드 넘김 키 매핑과 표시 이름. BLE 페달은 HID 키보드로 들어오므로 어떤 키를 보내는지는 기기마다 다름.
 // 기본값으로 시판 페달 대부분을 덮고, 맞지 않는 기기는 학습 모드로 직접 지정함.
 
 import 'package:flutter/services.dart';
@@ -23,6 +23,28 @@ final kDefaultPrevKeys = <LogicalKeyboardKey>{
   LogicalKeyboardKey.arrowUp,
   LogicalKeyboardKey.pageUp,
 };
+
+/// 넘김 키로 흔한 키의 한국어 이름. keyLabel은 영어이고 스페이스는 공백 한 칸이라 덮음.
+final _keyNames = <LogicalKeyboardKey, String>{
+  LogicalKeyboardKey.arrowRight: '오른쪽 화살표',
+  LogicalKeyboardKey.arrowLeft: '왼쪽 화살표',
+  LogicalKeyboardKey.arrowUp: '위쪽 화살표',
+  LogicalKeyboardKey.arrowDown: '아래쪽 화살표',
+  LogicalKeyboardKey.pageDown: '페이지 다운',
+  LogicalKeyboardKey.pageUp: '페이지 업',
+  LogicalKeyboardKey.space: '스페이스',
+  LogicalKeyboardKey.enter: '엔터',
+  LogicalKeyboardKey.audioVolumeUp: '볼륨 올림',
+  LogicalKeyboardKey.audioVolumeDown: '볼륨 내림',
+  LogicalKeyboardKey.mediaTrackNext: '다음 트랙',
+  LogicalKeyboardKey.mediaTrackPrevious: '이전 트랙',
+};
+
+/// 화면에 보일 키 이름. 표 → keyLabel → 키 코드 순으로 떨어짐(debugName은 릴리스에서 null이라 안 씀).
+String pedalKeyLabel(LogicalKeyboardKey key) {
+  final name = _keyNames[key] ?? key.keyLabel.trim();
+  return name.isNotEmpty ? name : '키 0x${key.keyId.toRadixString(16)}';
+}
 
 /// 넘김 키 두 벌. 한쪽에 지정한 키는 다른 쪽에서 빠져 같은 키가 양방향이 되지 않게 함.
 class PedalKeys {

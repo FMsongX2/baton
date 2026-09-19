@@ -14,9 +14,29 @@ import '../core/providers.dart';
 import '../score/timeline.dart';
 import '../theme.dart';
 import 'click_scheduler.dart';
+import 'clock.dart';
 
 /// 한 번에 펼쳐 두는 마디 수. 이만큼 치면 다시 처음부터 예약함.
 const _loopBars = 512;
+
+/// 재생 위치에 해당하는 마디 안 박 번호(0부터). 이음매 직후처럼 위치가 음수여도 앞 마디의 박으로 접음.
+/// 정수 나눗셈(~/)은 0 쪽으로 잘라 -1박이 0박(강박)으로 뜨므로 floor를 씀.
+int beatIndex(double positionSec, double beatSec, int beatsPerBar) =>
+    beatsPerBar <= 0 ? -1 : (positionSec / beatSec).floor() % beatsPerBar;
+
+/// 예약 창이 한 바퀴 끝에 닿으면 기준점을 한 바퀴 뒤로 물리고 예약 커서를 처음으로 돌림. 넘겼으면 true.
+/// 다 쓴 뒤에 넘기면 새 바퀴의 첫 강박이 이미 지난 시각이 되어 버려지므로 창에 들어오면 미리 넘김.
+/// 앞 바퀴에서 걸어 둔 끝 박은 위상이 그대로 이어지므로 거두지 않음.
+bool wrapLoop(PlaybackClock clock, ClickScheduler scheduler, Duration loop) {
+  if (loop <= Duration.zero || clock.position + scheduler.horizon < loop) return false;
+  // 앞선 pump 뒤에 엔진 시각이 올라 창 끝에 새로 든 앞 바퀴 클릭을 마저 예약함.
+  // 그대로 커서를 되돌리면 그 클릭은 영영 예약되지 않음
+  scheduler.pump();
+  clock.shift(loop);
+  // 위치가 음수가 되므로 커서를 처음으로 되돌려야 첫 강박부터 예약됨
+  scheduler.rewindTo(Duration.zero);
+  return true;
+}
 
 class MetronomePage extends ConsumerStatefulWidget {
   const MetronomePage({super.key, this.active = true});
@@ -34,6 +54,9 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
   late final _scheduler = ClickScheduler(_audio.soloud, _clock);
   late final Ticker _ticker;
 
+  /// 전화·이어폰 빠짐 같은 오디오 사건 구독. 오면 멈추고 다시 틀지 않음.
+  late final StreamSubscription<void> _halts;
+
   double _bpm = 120;
   int _clicksPerBar = 4;
   int _subdivision = 1;
@@ -46,23 +69,35 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
   List<Click> _clicks = const [];
   final _taps = <DateTime>[];
 
+  /// 지금 울리는 클릭 배열의 박 길이(초)와 한 바퀴 길이. 슬라이더를 끄는 동안 _bpm만 먼저 바뀌므로
+  /// 박 표시와 이음매는 _bpm이 아니라 이 값을 씀.
+  double _beatSeconds = 0.5;
+  Duration _loop = Duration.zero;
+
+  /// 이음매를 한 번이라도 넘었는지. 넘기 전의 음수 위치는 시작 대기(lead)라 박을 표시하지 않음.
+  bool _wrapped = false;
+
   @override
   void initState() {
     super.initState();
     _scheduler.accent = _audio.accent;
     _scheduler.tick = _audio.tick;
     _ticker = createTicker((_) => _onFrame());
+    _halts = _clock.halts.listen((_) {
+      if (_running) setState(_stop);
+    });
     if (widget.active) WakelockPlus.enable();
     _loadLatency();
   }
 
-  /// 저장된 지연 보정을 읽어 스케줄러에 넣음.
+  /// 저장된 지연 보정을 읽어 스케줄러에 넣음. 깨진 값은 0, 범위 밖은 스케줄러가 0~400ms로 접음.
   Future<void> _loadLatency() async {
     final ms = await ref.read(settingsRepoProvider).getDouble(kLatencyMsKey, 0);
-    _scheduler.latency = Duration(microseconds: (ms * 1000).round());
+    _scheduler.latency = Duration(microseconds: ((ms.isFinite ? ms : 0) * 1000).round());
   }
 
   /// 다른 탭으로 넘어가면 멈춤. 그대로 두면 악보 재생과 클릭이 겹쳐 들림.
+  /// 돌아오면 설정 탭에서 바꿨을 수 있는 지연 보정을 다시 읽음. 이 화면은 앱 수명 동안 살아 있음.
   /// 이어질 build가 화면을 맞춰 주므로 여기서 setState를 부르지 않음.
   @override
   void didUpdateWidget(MetronomePage old) {
@@ -71,6 +106,7 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
     if (widget.active) {
       // 연습 중 화면이 꺼지면 BPM과 박 표시가 사라짐. 소리만 남아 쓸모가 없음
       WakelockPlus.enable();
+      _loadLatency();
     } else {
       WakelockPlus.disable();
       if (_running) _stop();
@@ -82,13 +118,14 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
     // 재생 중에 트리에서 빠지면 아무도 멈춰 주지 않음. 활성 Ticker를 dispose하면 assert에 걸림
     if (_ticker.isActive) _ticker.stop();
     _ticker.dispose();
+    _halts.cancel();
     _scheduler.cancelPending();
     _beat.dispose();
     WakelockPlus.disable();
     super.dispose();
   }
 
-  /// 현재 설정으로 클릭을 다시 펼치고 처음부터 예약함.
+  /// 현재 설정으로 클릭을 다시 펼치고 처음부터 예약함. 박 표시·이음매용 길이도 이 설정으로 고정함.
   void _rebuild() {
     _clicks = metronomeClicks(
       bpm: _bpm,
@@ -96,8 +133,21 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
       bars: _loopBars,
       subdivision: _subdivision,
     );
+    _beatSeconds = 60.0 / safeBpm(_bpm);
+    _loop = _clicks.isEmpty
+        ? Duration.zero
+        : secondsToDuration(_clicks.last.time + _beatSeconds / _subdivision);
     _scheduler.volume = _volume;
     _scheduler.load(_clicks, _clock.position);
+  }
+
+  /// 처음부터 다시 셈. 기준점을 미래로 잡아 첫 강박이 예약되기 전에 지나가 버리지 않게 함.
+  void _restart() {
+    _scheduler.cancelPending();
+    _clock.reset();
+    _rebuild();
+    _wrapped = false;
+    _clock.start(_scheduler.startLead);
   }
 
   /// 클릭을 멈추고 위치를 0으로 되돌림. 다음 시작이 강박부터 나오게 함.
@@ -118,10 +168,7 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
     }
     setState(() {
       _running = true;
-      _scheduler.cancelPending();
-      _clock.reset();
-      _rebuild();
-      _clock.start();
+      _restart();
       _ticker.start();
     });
   }
@@ -129,31 +176,16 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
   /// 설정이 바뀌면 재생 중이라도 즉시 반영함. 템포가 바뀌면 박을 처음부터 다시 셈.
   void _apply(VoidCallback change) {
     setState(change);
-    if (!_running) return;
-    _scheduler.cancelPending();
-    _clock.reset();
-    _rebuild();
-    _clock.start();
+    if (_running) _restart();
   }
 
-  /// 매 프레임 클릭을 예약하고 화면의 박 표시를 갱신함.
+  /// 매 프레임 클릭을 예약하고 화면의 박 표시를 갱신함. 바퀴 끝에 닿으면 이어 붙임.
   void _onFrame() {
     _scheduler.pump();
     final now = _clock.position.inMicroseconds / 1e6;
-    final beatLen = 60.0 / _bpm;
-    final total = _clicksPerBar;
-    // 이음매 직후에는 위치가 잠깐 음수라 나머지 연산을 양수로 접어 줌
-    _beat.value = total == 0 ? -1 : ((now ~/ beatLen) % total + total) % total;
-
-    // 펼쳐 둔 마디를 다 쓰기 전에 이어 붙임. 다 쓴 뒤에 하면 새 루프의 첫 강박이
-    // 이미 지난 시각이 되어 버려짐. 룩어헤드 안에 들어오면 미리 넘김
-    final loopLength = _clicks.isEmpty ? 0.0 : _clicks.last.time + beatLen / _subdivision;
-    final lookaheadSec = _scheduler.lookahead.inMicroseconds / 1e6;
-    if (loopLength > 0 && now + lookaheadSec >= loopLength) {
-      _clock.shift(secondsToDuration(loopLength));
-      // 위치가 음수가 되므로 커서를 처음으로 되돌려야 첫 강박부터 예약됨
-      _scheduler.load(_clicks, Duration.zero);
-    }
+    // 이음매 직후의 음수 위치는 앞 바퀴의 끝 박. 시작 직후의 음수는 아직 아무 박도 울리지 않은 대기
+    _beat.value = now < 0 && !_wrapped ? -1 : beatIndex(now, _beatSeconds, _clicksPerBar);
+    if (wrapLoop(_clock, _scheduler, _loop)) _wrapped = true;
   }
 
   /// 탭 간격의 중앙값으로 템포를 잡음. 평균은 한 번 잘못 누르면 크게 흔들림.
@@ -216,7 +248,7 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             for (var i = 0; i < _clicksPerBar; i++)
-              _BeatDot(active: _running && beat == i, accent: i == 0),
+              BeatDot(active: _running && beat == i, accent: i == 0),
           ],
         ),
       ),
@@ -423,8 +455,9 @@ class _MetronomePageState extends ConsumerState<MetronomePage> with SingleTicker
 }
 
 /// 박자 표시 점. 강박은 크게 두고, 칠 때 살짝 커져 곁눈으로도 박이 보이게 함.
-class _BeatDot extends StatelessWidget {
-  const _BeatDot({required this.active, required this.accent});
+/// 커지는 것은 그리기만 바꿈. 레이아웃 크기가 바뀌면 강박마다 아래 컨트롤이 통째로 들썩임.
+class BeatDot extends StatelessWidget {
+  const BeatDot({super.key, required this.active, required this.accent});
 
   final bool active;
   final bool accent;
@@ -433,17 +466,22 @@ class _BeatDot extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final size = accent ? 26.0 : 18.0;
+    const duration = Duration(milliseconds: 90);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: kGapXs),
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 90),
-        width: active ? size * 1.3 : size,
-        height: active ? size * 1.3 : size,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: active
-              ? (accent ? scheme.secondary : scheme.primary)
-              : scheme.surfaceContainerHighest,
+      child: AnimatedScale(
+        scale: active ? 1.3 : 1,
+        duration: duration,
+        child: AnimatedContainer(
+          duration: duration,
+          width: size,
+          height: size,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active
+                ? (accent ? scheme.secondary : scheme.primary)
+                : scheme.surfaceContainerHighest,
+          ),
         ),
       ),
     );

@@ -1,6 +1,9 @@
-// 획 직렬화와 지우개 히트 테스트 검증. 필기는 사용자가 만든 데이터라 왕복에서 깨지면 복구 불가.
+// 획 직렬화·지우개 히트 테스트·필압 렌더 검증. 필기는 사용자가 만든 데이터라 왕복에서 깨지면 복구 불가.
+
+import 'dart:ui' show Size;
 
 import 'package:baton/reader/annotation/stroke.dart';
+import 'package:baton/reader/annotation/stroke_painter.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -69,5 +72,19 @@ void main() {
   test('빈 획은 아무것도 잡지 않음', () {
     final s = Stroke(tool: StrokeTool.pen, color: 0, width: 0.002, points: const []);
     expect(s.hitTest(const Offset(0.5, 0.5), 1.0), isFalse);
+  });
+
+  test('1을 넘는 옛 필압은 1로 접어 그려 굵기가 설정을 넘지 않음', () {
+    Stroke line(double p) => Stroke(
+      tool: StrokeTool.pen,
+      color: 0,
+      width: 0.01,
+      points: [for (var i = 0; i <= 10; i++) Offset(0.1 + i * 0.08, 0.5)],
+      pressures: List.filled(11, p),
+    );
+    const page = Size(1000, 1000);
+    final full = strokePath(line(1.0), page).getBounds();
+    final raw = strokePath(line(4.2), page).getBounds();
+    expect(raw.height, closeTo(full.height, 1e-6));
   });
 }

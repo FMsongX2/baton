@@ -4,12 +4,14 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:pdfrx/pdfrx.dart';
 
 import 'ads/ads.dart';
 import 'core/db/database.dart';
 import 'core/providers.dart';
+import 'core/storage/backup.dart';
 import 'core/storage/paths.dart';
 import 'library/library_page.dart';
 import 'library/library_repo.dart';
@@ -24,6 +26,8 @@ Future<void> main() async {
   // 빠뜨리면 앱을 켜고 바로 악보를 열었을 때 뷰어가 빈 화면으로 남음
   pdfrxFlutterInitialize();
   await AppPaths.init();
+  // DB를 열기 전에 끝내야 함. 되살리기 교체 도중 죽었다면 원래 라이브러리로 돌려놓음
+  await _recoverRestore();
   final audio = AudioService();
   await audio.init();
 
@@ -34,6 +38,15 @@ Future<void> main() async {
   runApp(UncontrolledProviderScope(container: container, child: const BatonApp()));
   // 동의 폼은 첫 화면 위에 떠야 하므로 runApp 뒤에 시작함. 기다리지 않음
   Ads.start();
+}
+
+/// 끝나지 않은 백업 되살리기를 되돌림. 실패해도 앱 시작을 막지 않고 표시가 남아 다음 시작에서 다시 함.
+Future<void> _recoverRestore() async {
+  try {
+    await recoverInterruptedRestore();
+  } catch (e) {
+    debugPrint('되살리기 복구 실패: $e');
+  }
 }
 
 /// 보관 기간이 지난 휴지통 항목과 그 파일을 지움. 실패해도 앱 시작을 막지 않음.
@@ -52,9 +65,13 @@ class BatonApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
     title: 'Baton',
+    restorationScopeId: 'baton',
     debugShowCheckedModeBanner: false,
     theme: batonTheme(Brightness.light),
     darkTheme: batonTheme(Brightness.dark),
+    // 한국어 전용. 지원 언어가 하나라 기기 언어가 무엇이든 기본 문구가 한국어로 떨어짐
+    localizationsDelegates: GlobalMaterialLocalizations.delegates,
+    supportedLocales: const [Locale('ko')],
     // 배너 칸을 Navigator 밖에 하나만 둠. 화면을 오가도 다시 요청하지 않고 전체 화면 push에서도 남음
     builder: (context, child) => AdFrame(child: child!),
     navigatorObservers: [Ads.modalObserver],
@@ -73,15 +90,22 @@ class _HomeShellState extends State<HomeShell> {
   int _tab = 0;
 
   /// 탭을 바꿔도 각 화면 상태가 살아 있도록 IndexedStack으로 둠.
+  /// 다른 탭에서 뒤로가기는 앱을 닫지 않고 악보 탭으로 돌아감.
   @override
   Widget build(BuildContext context) => Scaffold(
-    body: IndexedStack(
-      index: _tab,
-      children: [
-        const LibraryPage(),
-        MetronomePage(active: _tab == 1),
-        const SettingsPage(),
-      ],
+    body: PopScope(
+      canPop: _tab == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _tab != 0) setState(() => _tab = 0);
+      },
+      child: IndexedStack(
+        index: _tab,
+        children: [
+          LibraryPage(active: _tab == 0),
+          MetronomePage(active: _tab == 1),
+          const SettingsPage(),
+        ],
+      ),
     ),
     bottomNavigationBar: NavigationBar(
       selectedIndex: _tab,

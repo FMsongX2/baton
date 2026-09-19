@@ -25,7 +25,7 @@ class Stroke {
   /// 페이지 정규 좌표(0~1).
   final List<Offset> points;
 
-  /// 스타일러스 필압. 없으면 렌더러가 시뮬레이션함.
+  /// 스타일러스 필압(0~1). 없으면 렌더러가 시뮬레이션함.
   final List<double>? pressures;
 
   /// 렌더 캐시. 직렬화 대상이 아니며 pagePaintCallbacks가 매 프레임 호출되는 비용을 막음.
